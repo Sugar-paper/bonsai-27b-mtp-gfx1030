@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): close the gguf-py gap in the ledger, keep
+ mmvq-tq.cu as a deliberate gap
+
+---
+ fusion/state.json | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index 364ba64..3f24587 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -187,10 +187,10 @@
+     }
+   ],
+   "knownGaps": [
+-    "mmvq-tq.cu (568 lines of dp4a kernels in the reference) is not ported. Performance only.",
+-    "The HIP build dir is configured with LLAMA_BUILD_TESTS=OFF, so the turbo tests only build after an explicit reconfigure; ctest has been run that way and passes, but it is not part of the default build.",
+-    "gguf-py/gguf/constants.py has no entry for the turbo types.",
+-    "This worktree had no fusion/ ledger until now; these files are the first provenance record for it."
++    "mmvq-tq.cu (568 lines of dp4a kernels in the reference) is not ported. Performance only - the device-dequantise path in convert.cu/cpy.cu/getrows.cu already makes the types usable, just not at MMVQ speed. Deliberately deferred.",
++    "The HIP build dir is configured with LLAMA_BUILD_TESTS=OFF by default, so the turbo tests only build after an explicit reconfigure; ctest has been run that way and passes, but it is not part of the default build.",
++    "gguf-py/gguf/constants.py had no entry for TURBO3_0/TURBO4_0 while ggml.h declared them at 43/44. Closed in 885fdca (43/44 added, with the block sizes from ggml-common.h). The b11046 branch had the same gap plus TQ3_1S/TQ4_1S and was closed in e04ad0fdf there.",
++    "turbo KV at head_dim 128 cannot be re-measured on this host: no model with a 128-wide head is on disk (both local models are qwen35 with key_length 256) and the 1.5B fixture is gone. See knownDefects."
+   ],
+   "machine": {
+     "platform": "Windows",
+@@ -198,7 +198,7 @@
+     "gpuArchitecture": "gfx1030",
+     "rocm": "7.1"
+   },
+-  "updatedAt": "2026-09-19T19:20:00+08:00",
++  "updatedAt": "2026-09-19T19:35:00+08:00",
+   "buildRecommendation": {
+     "faAllQuants": "Either. Correctness was previously thought to depend on this; it does not - both configurations now measure 6.94-7.13 across the whole K/V matrix and both pass test-backend-ops FLASH_ATTN_EXT with zero failures. ON compiles every combination (447 s full rebuild, and no silent f16 fallback for exotic pairs); OFF compiles four plus the TurboQuant instances (much shorter build). This worktree is currently left ON.",
+     "hipGraphs": "GGML_HIP_GRAPHS is ON in this CMakeCache and the define is present in build.ninja (154 references), so unlike an earlier note it is NOT inert. It is also not a factor: running with GGML_CUDA_DISABLE_GRAPHS=1 reproduced the 307 failures byte-identically.",

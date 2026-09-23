@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] fix(cuda): restore the scale on the second q8_0 element,
+ dropped by our port
+
+dequantize_q8_0() lost `v.y *= d;` when the TurboQuant kernel port landed on this
+base (c6fbb78), so every odd element of a dequantised q8_0 row came back with its
+raw int8 magnitude instead of the block-scaled value. The line is present in
+PrismML's own prism branch (9a9394a) and in the b11046 replay; only this tree lost
+it.
+
+This is the single cause of both KV defects that were previously filed against
+PrismML's base and against GGML_CUDA_FA_ALL_QUANTS=ON:
+
+- FA's tile kernel always asks launch_fattn for f16 K and V, so any quantized K or
+  V is converted through to_fp16_cuda -> dequantize_block_q8_0 -> dequantize_q8_0.
+  The vector kernel handles q8_0 natively and was never affected, which is why only
+  the batch >= 3 cases and the cases whose KV length is not a multiple of 64 failed.
+- The build option looked responsible only because turning it off stops mixed K/V
+  pairs from taking the FA path at all.
+
+Measured before -> after, SC117 (head_dim 256), -c 512 -fa 1 --chunks 8:
+
+    K/V        FA_ALL_QUANTS ON     ON, fixed     OFF, fixed
+    f16/f16    6.9921               6.9921        6.9921
+    f16/q8_0   92.5372              6.9579        6.9735
+    q8_0/f16   7.3955               6.9824        6.9691
+    q8_0/q8_0  92.2627              6.9397        6.9397
+    q4_0/q4_0  7.0140               7.0140        7.0140
+    q4_0/q8_0  88.6076              6.9944        7.0127
+    q8_0/q4_0  7.4975               6.9985        6.9937
+    turbo3     7.1292               7.1292        7.1292
+
+test-backend-ops -o FLASH_ATTN_EXT: 307 q8_0 x q8_0 failures -> 0
+(2936/2936 with the option off, 3949/3949 with it on).
+---
+ ggml/src/ggml-cuda/dequantize.cuh | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+index 7d5c7f8..90d1253 100644
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -147,7 +147,9 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
+     v.y = x[ib].qs[iqs + 1];
+ 
+     v.x *= d;
++    v.y *= d;
+ }
++
+ // Turbo3: 3-bit PolarQuant (2-bit qs + 1-bit sign), block size 32
+ static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+     const block_turbo3_0 * x = (const block_turbo3_0 *) vx;

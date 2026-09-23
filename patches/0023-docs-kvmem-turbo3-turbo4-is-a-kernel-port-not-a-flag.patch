@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(kvmem): turbo3/turbo4 is a kernel port, not a flag
+ change
+
+---
+ docs/kvmem/FUSION-NOTES.md | 28 +++++++++++++++++++---------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+diff --git a/docs/kvmem/FUSION-NOTES.md b/docs/kvmem/FUSION-NOTES.md
+index c156425..43e2ba1 100644
+--- a/docs/kvmem/FUSION-NOTES.md
++++ b/docs/kvmem/FUSION-NOTES.md
+@@ -170,15 +170,25 @@ which now also prepends the lld-compat directory and passes `-DLLAMA_KVMEM=ON`.
+ 
+ ## Not done
+ 
+-- **`turbo3` / `turbo4` are not accepted as KV cache types by the KVMem tools.**
+-  `kvmem_parse_cache_type()` (`tools/kvmem/kvmem-spec.cpp`) allows only
+-  `f16|f32|q8_0|q5_0|q4_0`, and `kvmem_cache_types_ok()` gates quantized types to
+-  `{q8_0, q5_0, q4_0}`. PrismML's TurboQuant cache types therefore cannot be
+-  selected in the fused server, even though the kernel side would accept them:
+-  `kvmem_cache_pack_rows()` falls through to `ggml_quantize_chunk()` for any
+-  quantized type. Making this work needs (a) the two allow-lists extended and
+-  (b) a check that the turbo block layout survives KVMem's
+-  pack/unpack/`to_float` round trip. This is the open decision.
++- **`turbo3` / `turbo4` cannot be used as the KV cache type in the KVMem tools,
++  and this is a kernel port, not a flag change.** Two gates and one real blocker:
++  1. `kvmem_parse_cache_type()` (`tools/kvmem/kvmem-spec.cpp`) accepts only
++     `f16|f32|q8_0|q5_0|q4_0`, and `kvmem_cache_types_ok()` gates quantized types
++     to `{q8_0, q5_0, q4_0}`.
++  2. The host-side codec would cope: `kvmem_cache_pack_rows()` falls through to
++     `ggml_quantize_chunk()`, and `ggml.c:8155` has a real
++     `case GGML_TYPE_TURBO3_0: quantize_turbo3_0(...)`, with
++     `dequantize_row_turbo3_0` providing `to_float` for the unpack direction.
++  3. **`kvmem_stagein_quantize()` (`src/adapter/llama-kvmem-stagein.cu:583`)
++     returns false for every type except `Q8_0` and `Q4_0`.** The stage-in path
++     dequantises stored raw-K, applies RoPE (and FWHT) on device and then
++     re-quantises into the cache tensor; there is no turbo quantiser kernel, and
++     TURBO3_0's codec is grouped on 128 elements (`QK_TURBO3_GROUP`), so it is not
++     a drop-in for the existing per-block kernels.
++
++  Net: KVMem today runs `f16` or `q8_0`/`q5_0`/`q4_0` KV. Pairing it with
++  TurboQuant KV means writing `quant_turbo3_0` / `quant_turbo4_0` device kernels
++  (including the grouped WHT) and extending both allow-lists.
+ - KVMem's lightweight web UI (`tools/kvmem/ui/`) is served from `--ui-dir`; the
+   bundled copy in `kvmem-webui.h` is what actually ships.
+ - Five `kvmem_*_test` executables are defined by `kvmem/CMakeLists.txt` but are

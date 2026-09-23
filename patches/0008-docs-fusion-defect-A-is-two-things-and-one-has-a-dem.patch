@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): defect A is two things, and one has a
+ demonstrated fix
+
+GGML_CUDA_FA_ALL_QUANTS=ON corrupts attention for quantized V. Flipping it off on
+this build dir, verified to have landed (cache OFF, define gone from build.ninja,
+330 s rebuild instead of a no-op 26 s):
+
+  f16K x f16V    6.9921 -> 6.9921
+  f16K x q8_0V  92.5372 -> 6.9735     fixed
+  q8_0K x f16V   7.3955 -> 6.9691
+  q4_0K x q4_0V  7.0140 -> 7.0140
+  q4_0K x q8_0V 88.6076 -> 7.0127     fixed
+  q8_0K x q4_0V  7.4975 -> 6.9937
+  q8_0K x q8_0V 92.2627 -> 92.2627    still broken
+
+So most of what was reported as "q8_0 as V is broken" is a configuration defect.
+That also corrects the previous entry's framing: it was true under this build's
+option, not in general.
+
+What survives is one pairing, q8_0 K x q8_0 V, broken in both configurations with
+byte-identical values. Checked on it: the vec case IS declared in both branches of
+the switch, dequantize_q8_0 is byte-identical to upstream, none of PrismML's 93
+commits touched any FA file, and the llama.cpp base runs that pairing correctly at
+both head sizes. Next step is therefore kernel level, starting at the tile kernel
+where perplexity lands.
+
+Also recorded why GGML_HIP_GRAPHS is a dead end here: it is in the CMakeCache but
+appears zero times in build.ninja, so it never reached a translation unit.
+
+Build recommendation now in state.json: keep FA_ALL_QUANTS OFF on PrismML-derived
+trees. This build dir has been left that way.
+---
+ fusion/state.json           | 134 +++++++++++++++++++++++-------------
+ fusion/upstream-sync-log.md |  84 ++++++++++++++++++++++
+ 2 files changed, 171 insertions(+), 47 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index 1f55e03..d5f9a01 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -3,7 +3,6 @@
+   "project": "PrismML llama.cpp + TurboQuant local fusion",
+   "worktree": "<STACK>/sources/PrismML-turboquant-fusion",
+   "branch": "fusion-turboquant-on-prism",
+-
+   "official": {
+     "repository": "https://github.com/PrismML-Eng/llama.cpp.git",
+     "ref": "prism",
+@@ -12,7 +11,6 @@
+     "checkedAt": "2026-09-19",
+     "upstreamDelta": "none - origin/prism was already at 9a9394a when checked"
+   },
+-
+   "turboQuantSource": {
+     "repository": "https://github.com/iamwavecut/llama-cpp-turboquant.git",
+     "ref": "origin/feature/turboquant-kv-cache",
+@@ -21,7 +19,6 @@
+     "upstreamDelta": "none since 2026-04-08",
+     "warning": "The fork has since moved ahead of what was ported (turbo2_0, turbo-innerq.cuh, ggml-turbo-quant.c 329 -> 860 non-blank lines). Do NOT re-pull from it; take changes from the verified llama.cpp fusion branch instead."
+   },
+-
+   "measuredBaseline": {
+     "mergeBaseWithUpstreamMaster": "5ea87ddad22541a37053c7ba92b02ec1923617c6",
+     "mergeBaseDescribe": "b10615-1-g5ea87ddad",
+@@ -29,7 +26,6 @@
+     "commitsBehindUpstreamB11046": 430,
+     "note": "The prism branch is a real fork of ggml-org/llama.cpp, not a squashed import. Its release tag names prism-b10709-* but the verified merge-base is b10615-1, so the tag name overstates how current it is by roughly 94 commits. Worth asking PrismML to confirm."
+   },
+-
+   "commits": [
+     {
+       "commit": "c6fbb78",
+@@ -48,17 +44,25 @@
+       "scope": "integration layer: CLI, FA dispatch, convert tables, set-rows, graph rotations, CPU path, quantize_chunk, ggml_turbo_wht declaration, llama-bench names, tests"
+     }
+   ],
+-
+   "portStatus": "complete-for-gpu-and-cpu-cache-types",
+-
+   "verification": {
+     "build": "BUILD_OK, ROCm 7.1 clang + Ninja, gfx1030, GGML_HIP_MMQ_MFMA=ON, GGML_HIP_NO_VMM=ON, GGML_CUDA_FA_ALL_QUANTS=ON",
+     "cliAcceptsCacheTypes": "llama-server --help now lists turbo3, turbo4 (it did not before)",
+     "bench": {
+       "model": "qwen2.5-1.5b-instruct-q8_0",
+       "settings": "-p 256 -n 32 -ngl 999 -r 2",
+-      "prompt_tps": { "f16": 7801.5, "q8_0": 7635.8, "turbo3": 7449.1, "turbo4": 7467.7 },
+-      "gen_tps":    { "f16": 174.1,  "q8_0": 160.7,  "turbo3": 156.5,  "turbo4": 151.0 },
++      "prompt_tps": {
++        "f16": 7801.5,
++        "q8_0": 7635.8,
++        "turbo3": 7449.1,
++        "turbo4": 7467.7
++      },
++      "gen_tps": {
++        "f16": 174.1,
++        "q8_0": 160.7,
++        "turbo3": 156.5,
++        "turbo4": 151.0
++      },
+       "verdict": "all four cache types run; turbo costs roughly 4-10% against f16, which is the expected trade"
+     },
+     "ctest": {
+@@ -73,7 +77,12 @@
+     "perplexity": {
+       "model": "qwen2.5-1.5b-instruct-q8_0 (head_dim 128)",
+       "settings": "-c 512 -fa 1 --chunks 8 -ngl 999",
+-      "results": { "f16": 10.6801, "q8_0": 329.4764, "turbo3": 8038.7921, "turbo4": 4064.1819 },
++      "results": {
++        "f16": 10.6801,
++        "q8_0": 329.4764,
++        "turbo3": 8038.7921,
++        "turbo4": 4064.1819
++      },
+       "verdict": "f16 correct; q8_0 fails because of PrismML's own base defect and turbo3/turbo4 fail because of the shared head_dim 128 defect. Two independent causes - see knownDefects."
+     },
+     "production": {
+@@ -85,8 +94,17 @@
+       },
+       "perplexity": {
+         "settings": "-c 512 -fa 1 --chunks 8 -ngl 999, corpus wiki.test.raw",
+-        "results": { "f16": 6.9921, "q8_0": 6.9397, "turbo3": 7.1292, "turbo4": 7.0756 },
+-        "deltaVsF16": { "q8_0": "-0.75%", "turbo3": "+1.96%", "turbo4": "+1.19%" },
++        "results": {
++          "f16": 6.9921,
++          "q8_0": 6.9397,
++          "turbo3": 7.1292,
++          "turbo4": 7.0756
++        },
++        "deltaVsF16": {
++          "q8_0": "-0.75%",
++          "turbo3": "+1.96%",
++          "turbo4": "+1.19%"
++        },
+         "verdict": "all four sane and clustered; TurboQuant KV costs 1-2% perplexity at head_dim 256 for the context depth it buys, which is what makes it worth using"
+       },
+       "significance": "This is the same metric that fails at head_dim 128 (PPL 8038 for turbo3), measured on the runtime production actually uses. It converts the head_dim explanation from a generation-output observation into a measured fact, and it gives a usable quality number for the cache type the launchers run."
+@@ -98,46 +116,65 @@
+       "temp_clean_later/bench-results/sc117-turbo-kv-reality"
+     ]
+   },
+-
+   "knownDefects": [
+     {
+-      "id": "prism-base-breaks-q8_0-kv-at-any-head-dim",
++      "id": "fa-all-quants-on-corrupts-quantized-v-attention",
+       "severity": "high",
+-      "scope": "PrismML's own base only. Independent of TurboQuant and independent of head size.",
+-      "summary": "q8_0 KV is broken on this base at every head size measured: PPL 329.4764 at head_dim 128 and 92.2627 at head_dim 256, against 10.6801 / 6.9921 for f16. q4_0 KV is fine (7.0140 at head_dim 256) and f16 is fine.",
++      "scope": "build configuration, not code. Any tree built with GGML_CUDA_FA_ALL_QUANTS=ON.",
++      "summary": "Building with GGML_CUDA_FA_ALL_QUANTS=ON corrupts attention for every quantized-V combination except identical quantized K and V. Turning it off fixes f16K x q8_0V (92.5372 -> 6.9735), q4_0K x q8_0V (88.6076 -> 7.0127) and leaves the rest healthy.",
+       "evidence": {
+-        "build": "pristine PrismML, version 0.2.0-dev (build 1, commit 9a9394a), i.e. no TurboQuant code in the binary at all",
+-        "headDim256": { "model": "SC117 Qwen3.6-35B-A3B", "f16": 6.9921, "q8_0": 92.2627, "q4_0": 7.0140 },
+-        "headDim128": { "model": "qwen2.5-1.5B fixture", "f16": 10.6801, "q8_0": 329.4764 },
++        "build": "this worktree's build-hip, reconfigured with -DGGML_CUDA_FA_ALL_QUANTS=OFF; the reconfigure was verified to have landed (cache shows OFF, the define is gone from build.ninja, rebuild took 330 s rather than a no-op 26 s)",
++        "matrix": {
++          "f16K_f16V": {
++            "on": 6.9921,
++            "off": 6.9921
++          },
++          "f16K_q8_0V": {
++            "on": 92.5372,
++            "off": 6.9735
++          },
++          "q8_0K_f16V": {
++            "on": 7.3955,
++            "off": 6.9691
++          },
++          "q4_0K_q4_0V": {
++            "on": 7.014,
++            "off": 7.014
++          },
++          "q4_0K_q8_0V": {
++            "on": 88.6076,
++            "off": 7.0127
++          },
++          "q8_0K_q4_0V": {
++            "on": 7.4975,
++            "off": 6.9937
++          },
++          "q8_0K_q8_0V": {
++            "on": 92.2627,
++            "off": 92.2627
++          }
++        },
+         "recordPaths": [
+-          "temp_clean_later/bench-results/prism-baseline-kv",
+-          "temp_clean_later/bench-results/prism-fusion-verify"
++          "temp_clean_later/bench-results/prism-fa-allquants-off",
++          "temp_clean_later/bench-results/prism-fusion-kv-quadrant"
+         ]
+       },
+-      "whyItMatters": "This is what the q8_0 numbers in the entry below were mistakenly attributed to. The fusion's quality fixtures are head_dim 128 and PrismML's q8_0 is broken there, so any A/B against q8_0 on this base is meaningless until this is understood.",
+-      "hint": "PrismML's own KV work is scoped to Q4_0 by construction - the mean-centering feature rejects any K type other than Q4_0, and the docs say Q4_0 only. q4_0 working while q8_0 does not is consistent with a fork that only ever validated the Q4_0 path. Their 93 own commits touched llama-kv-cache.cpp (2), llama-context.cpp (7) and llama-graph.cpp (8), and no FA file at all, so the FA kernels are upstream's.",
+-      "localisedTo": {
+-        "side": "V only, not K",
+-        "evidence": {
+-          "q8_0K_f16V": 7.3955,
+-          "f16K_q8_0V": 92.5372,
+-          "q8_0K_q4_0V": 7.4975,
+-          "q4_0K_q8_0V": 88.6076
+-        },
+-        "statement": "Whenever V is q8_0 the result is garbage and the K type does not matter. This lines up with the kernels: K is consumed by a dot product against its quantized form, V is dequantised first.",
+-        "recordPath": "temp_clean_later/bench-results/prism-kv-quadrant"
+-      },
+-      "ruledOut": [
+-        "The TurboQuant port: this reproduces on the pristine build with no TurboQuant code.",
+-        "Head size: it fails at 128 and at 256.",
+-        "PrismML's KV mean-centering (7fb3d5b, 36d1dee). The cpy_k() hook is guarded by k_bar non-empty, k_bar is filled only by load_kv_mean_center(), and that runs only with --kv-mean-center, which was never passed.",
+-        "The attention rotation. LLAMA_ATTN_ROT_DISABLE=1 moves the number (92.2627 -> 104.8927, so the switch is live) without fixing anything, and leaves the control healthy (10.7160 -> 10.6632).",
+-        "HIP CUDA graphs, the one compile-time option where the builds differ (this one GGML_HIP_GRAPHS=ON, the llama.cpp fusion OFF). GGML_CUDA_DISABLE_GRAPHS=1 gives byte-identical numbers including the f16 control, so perplexity does not exercise that path. Aligning the option is still worthwhile.",
+-        "PrismML's edits to convert.cu (+117) and dequantize.cuh (+29): both only add their private types and contain no q8_0 line at all.",
+-        "A missing upstream fix in the FA files: fattn-vec.cuh saw 3 commits between the merge-base and b11046, fattn-common.cuh 2, set-rows.cu / cpy.cu / dequantize.cuh none, none about quantized V.",
+-        "The FA kernel at head_dim 128: test-backend-ops reports zero FLASH_ATTN_EXT failures at hsk=128, so the op is numerically right at that size."
++      "correction": "This also corrects the previous entry's 'whenever V is q8_0 the result is garbage'. That was true under the option this build uses; with the option off, V=q8_0 is fine against K=f16 and K=q4_0.",
++      "recommendation": "Do not build a PrismML-based tree with GGML_CUDA_FA_ALL_QUANTS=ON. The llama.cpp fusion builds with it OFF plus an explicit combination list, which is the configuration that has been behaving."
++    },
++    {
++      "id": "q8_0-kv-pair-broken-on-prism-base",
++      "severity": "medium",
++      "scope": "PrismML's base, both build configurations, both head sizes. The only pairing that fails.",
++      "summary": "q8_0 K with q8_0 V gives PPL 92.2627 (both build configurations) against 6.9921 for f16, with byte-identical per-chunk values, so it is one deterministic code path.",
++      "checked": [
++        "The FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0) case IS declared, in both branches of the option switch - the chooser finds it.",
++        "dequantize_q8_0 in dequantize.cuh is byte-identical to upstream's.",
++        "fattn-vec.cuh, fattn-common.cuh, fattn-tile.cuh and fattn.cu were not touched by any of PrismML's 93 own commits.",
++        "The llama.cpp base runs q8_0 x q8_0 correctly at both head sizes: 10.7160 at 128, 6.9397 at 256.",
++        "Not the head size, not the TurboQuant port, not the mean-centering or the attention rotation."
+       ],
+-      "nextStep": "Build-level bisect, which needs a build of the merge-base 5ea87ddad. git worktree add hangs on the whole-tree checkout in this environment; export with git archive | tar -x instead. If the merge-base is also broken the regression is upstream's (somewhere in the 430 commits this base lacks); if it is clean, bisect PrismML's 93 own commits."
++      "nextStep": "Kernel level rather than configuration level. Perplexity exercises BEST_FATTN_KERNEL_TILE, so start there and compare against upstream at the merge-base, then bisect PrismML's own commits if the merge-base is clean."
+     },
+     {
+       "id": "turbo-kv-broken-at-head-dim-128",
+@@ -149,20 +186,23 @@
+       "nextStep": "Chase the tile kernel's K/V dequantise path in convert.cu, then the rotation group logic at head_dim 128, on the llama.cpp branch where q8_0 is a working control."
+     }
+   ],
+-
+   "knownGaps": [
+     "mmvq-tq.cu (568 lines of dp4a kernels in the reference) is not ported. Performance only.",
+     "The HIP build dir is configured with LLAMA_BUILD_TESTS=OFF, so the turbo tests only build after an explicit reconfigure; ctest has been run that way and passes, but it is not part of the default build.",
+     "gguf-py/gguf/constants.py has no entry for the turbo types.",
+     "This worktree had no fusion/ ledger until now; these files are the first provenance record for it."
+   ],
+-
+   "machine": {
+     "platform": "Windows",
+     "gpu": "AMD Radeon RX 6900 XT",
+     "gpuArchitecture": "gfx1030",
+     "rocm": "7.1"
+   },
+-
+-  "updatedAt": "2026-09-19T16:30:00+08:00"
++  "updatedAt": "2026-09-19T18:05:00+08:00",
++  "buildRecommendation": {
++    "faAllQuants": "OFF. See knownDefects[0]: turning it on corrupts quantized-V attention for most combinations.",
++    "hipGraphs": "GGML_HIP_GRAPHS is present in this worktree's CMakeCache but is not wired into build.ninja at all, so the option is inert here. Not a factor either way.",
++    "turboInstances": "The TurboQuant FA vec instances are in the explicit CMake list, so they are compiled with FA_ALL_QUANTS=OFF too.",
++    "tests": "This build dir has LLAMA_BUILD_TESTS=ON for the ctest gate, so a bare ninja tries to compile PrismML's test-dspark-forward.cpp, which does not build on Windows (setenv). Build named targets."
++  }
+ }
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+index dd7de90..f19af8d 100644
+--- a/fusion/upstream-sync-log.md
++++ b/fusion/upstream-sync-log.md
+@@ -361,3 +361,87 @@ re-creating `gitdir` / `HEAD` / `commondir` under `.git/worktrees/<name>` by han
+ plus a `git reset` to rebuild the index. `git worktree repair` cannot help: it needs
+ the admin entry in order to locate the repository, which is exactly what is gone.
+ Script: `temp_clean_later/scripts/restore-worktree-admin.py`.
++
++## 2026-09-19 (final+): defect A splits in two, and one of them has a demonstrated fix
++
++Chasing defect A further. Two things happened: a build-option difference turned out
++to matter, and the "V side" framing from the previous entry turned out to be shaped
++by that option.
++
++### A1 - GGML_CUDA_FA_ALL_QUANTS=ON breaks quantized-V attention
++
++The two builds differ in 21 CMake options; the ones that can affect CUDA kernel
++selection are `GGML_CUDA_FA_ALL_QUANTS` (PrismML ON, llama.cpp fusion OFF with an
++explicit 12-combination list), `GGML_HIP_GRAPHS` (ON vs OFF) and
++`GGML_HIP_ROCWMMA_FATTN`.
++
++Flipping `GGML_CUDA_FA_ALL_QUANTS` to OFF on this worktree's build and re-running:
++
++| K | V | ON | OFF |
++| --- | --- | --- | --- |
++| f16 | f16 | 6.9921 | 6.9921 |
++| f16 | q8_0 | **92.5372** | **6.9735** |
++| q8_0 | f16 | 7.3955 | 6.9691 |
++| q4_0 | q4_0 | 7.0140 | 7.0140 |
++| q4_0 | q8_0 | 88.6076 | 7.0127 |
++| q8_0 | q4_0 | 7.4975 | 6.9937 |
++| **q8_0** | **q8_0** | **92.2627** | **92.2627** |
++
++Turning the option off fixes every quantized-V combination **except q8_0 x q8_0**.
++So the option is the single cause of most of what was being reported as "q8_0 V is
++broken", and it is a configuration defect rather than a code defect.
++
++This also **corrects the previous entry's framing**: "whenever V is q8_0 the result
++is garbage" was true *under the option that this build uses*. With the option off,
++V=q8_0 is fine with K=f16 and K=q4_0. The statement that survives is the much
++narrower one below.
++
++`GGML_HIP_GRAPHS` is a dead end in this worktree: the option is in the CMakeCache but
++**`GGML_HIP_GRAPHS` appears zero times in build.ninja**, so the define never reaches
++any translation unit - which is why flipping it produced a 26-second no-op build and
++byte-identical results. Graphs were already excluded by the runtime test
++(`GGML_CUDA_DISABLE_GRAPHS=1` -> byte-identical numbers).
++
++### A2 - q8_0 x q8_0 is broken either way
++
++The only combination that fails in both configurations, at 92.2627 with
++byte-identical per-chunk values. That is the real code defect, and its scope is now
++one pairing out of the seven measured instead of "quantized KV".
++
++Checked so far on that pairing:
++
++* the `FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)` case **is** declared, in
++  both branches of the `GGML_CUDA_FA_ALL_QUANTS` switch, so the chooser does find it;
++* `dequantize_q8_0` in `dequantize.cuh` is **byte-identical** to upstream's;
++* `fattn-vec.cuh`, `fattn-common.cuh`, `fattn-tile.cuh` and `fattn.cu` were not
++  touched by any of PrismML's 93 commits;
++* the llama.cpp base runs q8_0 x q8_0 correctly at both head sizes (10.7160 at 128,
++  6.9397 at 256).
++
++So the defect is in what that one kernel path depends on, and the next step is
++kernel-level rather than configuration-level: start from the tile kernel (perplexity
++exercises `BEST_FATTN_KERNEL_TILE`), comparing against upstream at the merge-base.
++
++### Method note
++
++The first attempt at the option flip "rebuilt" in 26 seconds and produced
++byte-identical numbers, which looked like "the option makes no difference". It was
++actually a **no-op**: the option was not wired into any compile command at all. The
++check that catches this is to confirm the define reached `build.ninja` (and that the
++wall clock is consistent with a real recompile - the genuine flip took 330 s). A fast
++build after a config change is a signal to verify the config actually landed, not a
++result.
++
++Second note: this build directory has `LLAMA_BUILD_TESTS=ON` from the ctest work, so a
++bare `ninja` tries to compile PrismML's `test-dspark-forward.cpp`, which does not build
++on Windows (`setenv`). Build named targets (`llama-perplexity`, `llama-server`) instead.
++
++Records: `temp_clean_later/bench-results/prism-graphs-off-build`,
++`prism-fa-allquants-off`, `prism-fusion-kv-quadrant`, `prism-graphs-probe`.
++
++### Build configuration recommendation
++
++**Do not build a PrismML-based tree with `GGML_CUDA_FA_ALL_QUANTS=ON`.** It silently
++corrupts quantized-V attention for every combination except identical quantized K and
++V. The llama.cpp fusion already builds with it OFF plus an explicit combination list,
++which is the configuration that has been behaving.

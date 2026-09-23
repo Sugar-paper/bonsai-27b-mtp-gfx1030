@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] fix(ggml): GGML_OP_COUNT is 103, not 102
+
+The kvmem patch inserts GGML_OP_GATED_DELTA_NET_RECORD into ggml-ops. The prism
+branch already carried GGML_OP_TURBO_WHT, so the enum lands on 103 rather than
+the 102 the patch expected. Both static_asserts in ggml.c were left at the
+pre-patch value; GGML_OP_NAME and GGML_OP_SYMBOL already have 103 entries, so
+only the assertions needed bumping.
+
+Note: ggml/include/ggml-rpc.h still asserts 101 and is stale independently of
+this change (it was already stale at 102). Left alone because touching it means
+deciding an RPC_PROTO_PATCH_VERSION bump.
+---
+ ggml/src/ggml.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5aae92a..b86f218 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1134,7 +1134,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GATED_DELTA_NET_RECORD",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ // ggml_turbo_wht
+ 
+@@ -1282,7 +1282,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "gated_delta_net_record(q, k, v, g, beta, s)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 

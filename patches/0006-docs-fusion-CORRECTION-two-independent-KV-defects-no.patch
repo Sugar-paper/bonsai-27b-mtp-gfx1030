@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): CORRECTION - two independent KV defects, not
+ one head_dim story
+
+The previous entry concluded "quantized KV + FA is broken at head_dim 128". That
+was wrong. All the head_dim 256 evidence had been taken on the promoted llama.cpp
+runtime, never on PrismML's own build. Running the pristine PrismML build (build 1,
+commit 9a9394a, no TurboQuant code) on SC117 (head_dim 256):
+
+  f16 6.9921    q8_0 92.2627    q4_0 7.0140
+
+q8_0 KV is broken on PrismML's base at every head size - 329.4764 at 128 and
+92.2627 at 256 - so the 329 in the earlier table was never a head_dim effect. It
+just happened to sit next to a real one.
+
+Two independent defects:
+
+  A. PrismML's base breaks q8_0 KV at any head size. Reproduces on the pristine
+     build, q4_0 is fine, and their own KV work is scoped to Q4_0 by construction
+     (the mean-centering feature rejects any other K type). Their 93 own commits
+     touched no FA file at all.
+
+  B. TurboQuant KV breaks at head_dim 128 (8038.7921) and is fine at 256 (7.1292),
+     on both branches, with q8_0 as a working control on the llama.cpp base.
+
+The cheap test that would have separated them - PrismML's own build with q8_0 KV on
+a head_dim 256 model - was skipped because those numbers already existed on the
+other runtime. Cross-runtime comparisons need the same control run on both.
+
+Also recorded: test-backend-ops on this build reports FLASH_ATTN_EXT failures
+clustered at hsk=72 (the non-128 padding gap the port map already tracks) and ZERO
+at hsk=128, so the attention kernel is numerically right at 128 and defect B is at
+the graph / cache level rather than in the kernel.
+---
+ fusion/state.json           | 43 ++++++++++++++++--------
+ fusion/upstream-sync-log.md | 66 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 13 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index f240ee8..23ad0d2 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -74,7 +74,7 @@
+       "model": "qwen2.5-1.5b-instruct-q8_0 (head_dim 128)",
+       "settings": "-c 512 -fa 1 --chunks 8 -ngl 999",
+       "results": { "f16": 10.6801, "q8_0": 329.4764, "turbo3": 8038.7921, "turbo4": 4064.1819 },
+-      "verdict": "f16 correct; every quantized cache type wrong"
++      "verdict": "f16 correct; q8_0 fails because of PrismML's own base defect and turbo3/turbo4 fail because of the shared head_dim 128 defect. Two independent causes - see knownDefects."
+     },
+     "production": {
+       "model": "SC117 Qwen3.6-35B-A3B (head_dim 256)",
+@@ -101,20 +101,37 @@
+ 
+   "knownDefects": [
+     {
+-      "id": "quantized-kv-broken-at-head-dim-128",
+-      "severity": "medium",
+-      "scope": "both the PrismML base and the TurboQuant cache types; only affects head_dim 128 models",
+-      "summary": "With quantized KV and -fa 1, perplexity at head_dim 128 is garbage: q8_0 329.4764 and turbo3 8038.7921 against 10.6801 for f16. Generation is garbage too ('I.is.is is ew' instead of 'Paris').",
+-      "notCausedBy": "The port. The original PrismML build, from which this worktree was forked, returns 329.4764 for the same q8_0 KV command with byte-identical per-chunk values. q8_0 KV has nothing to do with TurboQuant.",
+-      "notUniversal": "head_dim 256 models are fine. SC117 generates identical text with q8_0, turbo3 and turbo4 KV on the promoted runtime, so this is not 'the turbo cache is broken'.",
+-      "whyItMatters": "The fusion's own quality fixtures are head_dim 128, so the gate cannot be evaluated on them until this is fixed. Every production model here is head_dim 256 and unaffected.",
++      "id": "prism-base-breaks-q8_0-kv-at-any-head-dim",
++      "severity": "high",
++      "scope": "PrismML's own base only. Independent of TurboQuant and independent of head size.",
++      "summary": "q8_0 KV is broken on this base at every head size measured: PPL 329.4764 at head_dim 128 and 92.2627 at head_dim 256, against 10.6801 / 6.9921 for f16. q4_0 KV is fine (7.0140 at head_dim 256) and f16 is fine.",
++      "evidence": {
++        "build": "pristine PrismML, version 0.2.0-dev (build 1, commit 9a9394a), i.e. no TurboQuant code in the binary at all",
++        "headDim256": { "model": "SC117 Qwen3.6-35B-A3B", "f16": 6.9921, "q8_0": 92.2627, "q4_0": 7.0140 },
++        "headDim128": { "model": "qwen2.5-1.5B fixture", "f16": 10.6801, "q8_0": 329.4764 },
++        "recordPaths": [
++          "temp_clean_later/bench-results/prism-baseline-kv",
++          "temp_clean_later/bench-results/prism-fusion-verify"
++        ]
++      },
++      "whyItMatters": "This is what the q8_0 numbers in the entry below were mistakenly attributed to. The fusion's quality fixtures are head_dim 128 and PrismML's q8_0 is broken there, so any A/B against q8_0 on this base is meaningless until this is understood.",
++      "hint": "PrismML's own KV work is scoped to Q4_0 by construction - the mean-centering feature rejects any K type other than Q4_0, and the docs say Q4_0 only. q4_0 working while q8_0 does not is consistent with a fork that only ever validated the Q4_0 path. Their 93 own commits touched llama-kv-cache.cpp (2), llama-context.cpp (7) and llama-graph.cpp (8), and no FA file at all, so the FA kernels are upstream's.",
+       "ruledOut": [
+-        "PrismML's own KV mean-centering feature (commits 7fb3d5b, 36d1dee). It is opt-in via --kv-mean-center, scoped to Q4_0 only, and the flag was never passed.",
+-        "An upstream fix that this base predates. Between the prism merge-base (5ea87ddad) and b11046 the FA vec file only saw 3 commits (73a43d1f6, 8e93a9773, 16378d93f), none about head sizes or quantized KV.",
+-        "The turbo codec and the WHT op. ctest passes with values identical to the llama.cpp fusion's."
++        "The TurboQuant port: this reproduces on the pristine build with no TurboQuant code.",
++        "Head size: it fails at 128 and at 256.",
++        "An upstream fix this base predates. Between the prism merge-base (5ea87ddad) and b11046 the FA vec file only saw 3 commits (73a43d1f6, 8e93a9773, 16378d93f), none about head sizes or quantized KV.",
++        "The FA kernel at head_dim 128: test-backend-ops reports zero FLASH_ATTN_EXT failures at hsk=128 in this build, so the op is numerically right and the breakage is at the graph / cache level."
+       ],
+-      "structure": "Per the project's own port map, a 512-token prompt batch selects BEST_FATTN_KERNEL_TILE while single-token generation selects BEST_FATTN_KERNEL_VEC. Perplexity therefore exercises the tile path and my llama-cli test exercised the vec path, and both are broken at head_dim 128 - so this is not one kernel.",
+-      "nextStep": "Bisect at head_dim 128 with q8_0 KV as the control, since q8_0 is fine on the llama.cpp base and broken on this one: that difference points at PrismML's own 93 commits rather than at the TurboQuant port. Then, separately, chase the turbo3 failure on the llama.cpp base, where q8_0 is fine, through the tile kernel's K/V dequantise path in convert.cu."
++      "nextStep": "Diff PrismML's llama-kv-cache.cpp against its own merge-base and check the cpy_k() path for a Q4_0-only assumption that q8_0 violates. q4_0 working and q8_0 not is the whole clue."
++    },
++    {
++      "id": "turbo-kv-broken-at-head-dim-128",
++      "severity": "medium",
++      "scope": "the TurboQuant cache types, on both fusion branches. Not PrismML-specific.",
++      "summary": "turbo3 KV gives PPL 8038.7921 at head_dim 128 and 7.1292 at head_dim 256; turbo4 gives 4064.1819 and 7.0756. Byte-identical per-chunk values on both branches, so it is one shared code path.",
++      "notCausedBy": "The port, and not the q8_0 breakage above: on the llama.cpp base q8_0 KV at head_dim 128 is correct (10.7160) while turbo3 is not.",
++      "structure": "A 512-token prompt batch selects BEST_FATTN_KERNEL_TILE and single-token generation selects BEST_FATTN_KERNEL_VEC, so both paths are implicated.",
++      "nextStep": "Chase the tile kernel's K/V dequantise path in convert.cu, then the rotation group logic at head_dim 128, on the llama.cpp branch where q8_0 is a working control."
+     }
+   ],
+ 
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+index 1197fd4..b74d924 100644
+--- a/fusion/upstream-sync-log.md
++++ b/fusion/upstream-sync-log.md
+@@ -224,3 +224,69 @@ costs 1-2% perplexity** against f16 on this model, which is the price of the
+ context depth it buys. q8_0 KV comes in marginally *below* f16, i.e. inside noise.
+ 
+ Records: `temp_clean_later/bench-results/sc117-kv-ppl`.
++
++## 2026-09-19 (later still): CORRECTION — there are two defects, not one
++
++The entry above concluded that "quantized KV + FA is broken at head_dim 128". That
++was wrong, and the way it was wrong is worth recording.
++
++All the head_dim 256 evidence had been taken on the promoted **llama.cpp** runtime,
++never on PrismML's own build. Running the pristine PrismML build (build 1, commit
++9a9394a, no TurboQuant code at all) on SC117 — head_dim **256**, the head size that
++was supposed to be the good case — gives:
++
++| KV | PPL at head_dim 256 | |
++| --- | --- | --- |
++| f16 | 6.9921 | fine |
++| **q8_0** | **92.2627** | broken |
++| q4_0 | 7.0140 | fine |
++
++So q8_0 KV is broken on PrismML's base **at every head size** (329.4764 at 128,
++92.2627 at 256). The 329 in the earlier table was never a head_dim effect; it was
++PrismML's own bug, and it happened to sit next to a real head_dim effect.
++
++The corrected picture, two independent defects:
++
++**A — PrismML's base breaks q8_0 KV, at any head size.** Reproduces on the pristine
++build, so the TurboQuant port is not involved. q4_0 is fine, and their own KV work
++is scoped to Q4_0 by construction (the mean-centering feature errors out on any K
++type other than Q4_0, and the docs say Q4_0 only) — a fork that only ever validated
++the Q4_0 path is exactly what "q4_0 works, q8_0 does not" looks like. Their 93 own
++commits touched `llama-kv-cache.cpp` (2), `llama-context.cpp` (7) and
++`llama-graph.cpp` (8), and **no FA file at all**, so the kernels are upstream's.
++
++**B — TurboQuant KV breaks at head_dim 128.** turbo3 8038.7921 at 128 vs 7.1292 at
++256; turbo4 4064.1819 vs 7.0756. Byte-identical per-chunk values on both branches,
++so it is one shared code path, and on the llama.cpp base q8_0 at head_dim 128 is a
++working control (10.7160). This one is real and it is TurboQuant's.
++
++### How the earlier framing went wrong
++
++The original table was read as "f16 fine, every quantized type broken → it must be
++about head size". That is only valid if the quantized types share a cause, and they
++did not: one of them was PrismML's q8_0 bug and the other was the TurboQuant
++head_dim bug. The cheap test that would have caught it — PrismML's own build with
++q8_0 KV on a head_dim 256 model — was not run, because the head_dim 256 numbers had
++already been taken on the other runtime. **Cross-runtime comparisons need the same
++control run on both runtimes.**
++
++### Op-level localisation, kept because it still holds
++
++`test-backend-ops` (built here with tests ON) on this build:
++
++```text
++FLASH_ATTN_EXT  -> Backend ROCm0: FAIL, 102 cases
++                   by hsk: 72 -> 98, 256 -> 3, 64 -> 1      hsk 128 -> 0
++SET_ROWS        -> Backend ROCm0: OK
++```
++
++Two things follow. The hsk=72 cluster is the non-128 head padding gap the port map
++already tracks as open, not this defect. And **hsk=128 has zero FLASH_ATTN_EXT
++failures**, so at the op level the attention kernel is numerically right there —
++which puts defect B at the graph / cache level rather than in the kernel, and rules
++the kernel out as the place to look first.
++
++One trap worth recording: the first run of that instrument reported
++`failed to initialize ROCm: no ROCm-capable device is detected` and silently tested
++only the CPU backend, because the script put ROCm's `bin` ahead of the compat
++runtime on PATH. The compat directory has to come first.

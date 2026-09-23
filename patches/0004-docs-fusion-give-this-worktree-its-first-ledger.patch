@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): give this worktree its first ledger
+
+The PrismML fusion had no fusion/ directory, so it had no provenance record at
+all: not what it was forked from, not what had been ported, not what had been
+verified. state.json and upstream-sync-log.md now carry that, reconstructed from
+the repository plus the audit run today.
+
+The headline entries are the audit result (the fusion was a type/kernel half with
+no integration, so --cache-type-k turbo3 was rejected) and the measurement that
+came out of verifying the fix: quantized KV with flash attention is broken at
+head_dim 128 - for q8_0 as much as for turbo3 - and works at head_dim 256, which
+is what every production model here uses.
+---
+ fusion/state.json           | 113 +++++++++++++++++++++++++++++
+ fusion/upstream-sync-log.md | 141 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 254 insertions(+)
+ create mode 100644 fusion/state.json
+ create mode 100644 fusion/upstream-sync-log.md
+
+diff --git a/fusion/state.json b/fusion/state.json
+new file mode 100644
+index 0000000..dbe0d0d
+--- /dev/null
++++ b/fusion/state.json
+@@ -0,0 +1,113 @@
++{
++  "schemaVersion": 1,
++  "project": "PrismML llama.cpp + TurboQuant local fusion",
++  "worktree": "<STACK>/sources/PrismML-turboquant-fusion",
++  "branch": "fusion-turboquant-on-prism",
++
++  "official": {
++    "repository": "https://github.com/PrismML-Eng/llama.cpp.git",
++    "ref": "prism",
++    "commit": "9a9394a895b96003ca842a6041cb28ac49a108f7",
++    "tagOnThatCommit": "prism-b10709-9a9394a",
++    "checkedAt": "2026-09-19",
++    "upstreamDelta": "none - origin/prism was already at 9a9394a when checked"
++  },
++
++  "turboQuantSource": {
++    "repository": "https://github.com/iamwavecut/llama-cpp-turboquant.git",
++    "ref": "origin/feature/turboquant-kv-cache",
++    "commit": "89da8debdfb082fecd77e4582ce01ebf2c425c26",
++    "checkedAt": "2026-09-19",
++    "upstreamDelta": "none since 2026-04-08",
++    "warning": "The fork has since moved ahead of what was ported (turbo2_0, turbo-innerq.cuh, ggml-turbo-quant.c 329 -> 860 non-blank lines). Do NOT re-pull from it; take changes from the verified llama.cpp fusion branch instead."
++  },
++
++  "measuredBaseline": {
++    "mergeBaseWithUpstreamMaster": "5ea87ddad22541a37053c7ba92b02ec1923617c6",
++    "mergeBaseDescribe": "b10615-1-g5ea87ddad",
++    "prismOwnCommits": 93,
++    "commitsBehindUpstreamB11046": 430,
++    "note": "The prism branch is a real fork of ggml-org/llama.cpp, not a squashed import. Its release tag names prism-b10709-* but the verified merge-base is b10615-1, so the tag name overstates how current it is by roughly 94 commits. Worth asking PrismML to confirm."
++  },
++
++  "commits": [
++    {
++      "commit": "c6fbb78",
++      "subject": "feat(ggml): port TurboQuant turbo3/turbo4 KV + WHT kernels",
++      "scope": "types, block layouts, kernels, FA vec instances, CMake lists",
++      "verdict": "incomplete - a type/kernel half with no integration; the cache types could not be selected from the CLI"
++    },
++    {
++      "commit": "863eb01",
++      "subject": "style(fusion): drop 2362 blank lines the port inserted after every line",
++      "scope": "5 files whose length had doubled without changing a statement"
++    },
++    {
++      "commit": "7d103ee",
++      "subject": "feat(fusion): complete the TurboQuant fusion, the cache types were unusable",
++      "scope": "integration layer: CLI, FA dispatch, convert tables, set-rows, graph rotations, CPU path, quantize_chunk, ggml_turbo_wht declaration, llama-bench names, tests"
++    }
++  ],
++
++  "portStatus": "complete-for-gpu-and-cpu-cache-types",
++
++  "verification": {
++    "build": "BUILD_OK, ROCm 7.1 clang + Ninja, gfx1030, GGML_HIP_MMQ_MFMA=ON, GGML_HIP_NO_VMM=ON, GGML_CUDA_FA_ALL_QUANTS=ON",
++    "cliAcceptsCacheTypes": "llama-server --help now lists turbo3, turbo4 (it did not before)",
++    "bench": {
++      "model": "qwen2.5-1.5b-instruct-q8_0",
++      "settings": "-p 256 -n 32 -ngl 999 -r 2",
++      "prompt_tps": { "f16": 7801.5, "q8_0": 7635.8, "turbo3": 7449.1, "turbo4": 7467.7 },
++      "gen_tps":    { "f16": 174.1,  "q8_0": 160.7,  "turbo3": 156.5,  "turbo4": 151.0 },
++      "verdict": "all four cache types run; turbo costs roughly 4-10% against f16, which is the expected trade"
++    },
++    "perplexity": {
++      "model": "qwen2.5-1.5b-instruct-q8_0 (head_dim 128)",
++      "settings": "-c 512 -fa 1 --chunks 8 -ngl 999",
++      "results": { "f16": 10.6801, "q8_0": 329.4764, "turbo3": 8038.7921, "turbo4": 4064.1819 },
++      "verdict": "f16 correct; every quantized cache type wrong"
++    },
++    "production": {
++      "model": "SC117 Qwen3.6-35B-A3B (head_dim 256)",
++      "runtime": "runtimes/llama.cpp-turboquant-fusion-rocm71-gfx1030-b10335",
++      "settings": "-c 4096 -fa 1 -ngl 999, greedy",
++      "result": "q8_0, turbo3 and turbo4 KV all generate identical text and run at the same speed",
++      "verdict": "turbo cache types work where they are actually used"
++    },
++    "recordPaths": [
++      "temp_clean_later/bench-results/prism-fusion-probe",
++      "temp_clean_later/bench-results/prism-fusion-verify",
++      "temp_clean_later/bench-results/prism-baseline-kv",
++      "temp_clean_later/bench-results/sc117-turbo-kv-reality"
++    ]
++  },
++
++  "knownDefects": [
++    {
++      "id": "quantized-kv-broken-at-head-dim-128",
++      "severity": "medium",
++      "scope": "both the PrismML base and the TurboQuant cache types; only affects head_dim 128 models",
++      "summary": "With quantized KV and -fa 1, perplexity at head_dim 128 is garbage: q8_0 329.4764 and turbo3 8038.7921 against 10.6801 for f16. Generation is garbage too ('I.is.is is ew' instead of 'Paris').",
++      "notCausedBy": "The port. The original PrismML build, from which this worktree was forked, returns 329.4764 for the same q8_0 KV command with byte-identical per-chunk values. q8_0 KV has nothing to do with TurboQuant.",
++      "notUniversal": "head_dim 256 models are fine. SC117 generates identical text with q8_0, turbo3 and turbo4 KV on the promoted runtime, so this is not 'the turbo cache is broken'.",
++      "whyItMatters": "The fusion's own quality fixtures are head_dim 128, so the gate cannot be evaluated on them until this is fixed. Every production model here is head_dim 256 and unaffected.",
++      "nextStep": "Bisect the FA vec path at D=128 against D=256: start with cpy_ne / V_rows_per_thread in fattn-vec.cuh, then the q8_0 path in the same kernel, since q8_0 fails too and has no TurboQuant code in it."
++    }
++  ],
++
++  "knownGaps": [
++    "mmvq-tq.cu (568 lines of dp4a kernels in the reference) is not ported. Performance only.",
++    "The HIP build is configured with LLAMA_BUILD_TESTS=OFF because PrismML's test-dspark-forward.cpp needs setenv. The two turbo tests are wired into tests/CMakeLists.txt but are not compiled by this build, so the ctest gate has not actually been run here.",
++    "gguf-py/gguf/constants.py has no entry for the turbo types.",
++    "This worktree had no fusion/ ledger until now; these files are the first provenance record for it."
++  ],
++
++  "machine": {
++    "platform": "Windows",
++    "gpu": "AMD Radeon RX 6900 XT",
++    "gpuArchitecture": "gfx1030",
++    "rocm": "7.1"
++  },
++
++  "updatedAt": "2026-09-19T16:30:00+08:00"
++}
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+new file mode 100644
+index 0000000..117d267
+--- /dev/null
++++ b/fusion/upstream-sync-log.md
+@@ -0,0 +1,141 @@
++# Upstream Sync Log — PrismML llama.cpp + TurboQuant fusion
++
++Append a new section for every upstream update or port attempt. Do not replace
++historical entries.
++
++This worktree had no ledger until 2026-09-19: the three commits below are the
++first recorded history, reconstructed from the repository and from a fresh audit.
++
++## 2026-09-19: audit — the fusion was not actually complete
++
++Asked whether the fusion was done, and it was not. `c6fbb78` ported the
++TurboQuant types and kernels but none of the integration, so the feature was
++unreachable end to end:
++
++```text
++$ llama-cli -m <model> -ctk turbo3 -ctv turbo3
++error while handling argument "-ctk": Unsupported cache type: turbo3
++allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
++
++$ llama-bench -ctk turbo3
++error: invalid parameter for argument: -ctk
++
++$ llama-server --help | grep turbo
++(no output)
++```
++
++Audit findings, measured rather than assumed:
++
++| what | verdict |
++| --- | --- |
++| base build and ternary model | ✅ sound; Bonsai PQ2_0 317.9/45.1 t/s vs 316.9/45.3 on the original PrismML build, i.e. no regression |
++| type registration, block layouts, kernels | ✅ present |
++| integration layer | ❌ absent: `common/arg.cpp`, `set-rows.cu`, `fattn.cu`, `llama-graph.cpp`, `llama-kv-cache.cpp`, `llama-context.cpp`, the CPU path, `llama-bench.cpp` |
++| `ggml_turbo_wht` declaration | ❌ missing from `ggml.h` (defined in `ggml.c` only, so nothing could call it) |
++| `ggml_quantize_chunk` | ❌ no cases, and the switch is `default: assert(false)` |
++| `convert.cu` | ❌ only carried `#include "turbo-quant.cuh"`, no table entries |
++| tests, ledger | ❌ neither existed |
++| file hygiene | ⚠️ 5 files had doubled in length, ~2562 inserted blank lines |
++
++## 2026-09-19: `863eb01` — drop the inserted blank lines
++
++The port emitted every line followed by an empty line, doubling five files
++without changing a statement. The inserted lines had no trailing blank, which
++breaks a naive odd/even split, so the rebuild aligned the non-blank sequences
++against the pristine `9a9394a` version and replayed only the real insertions.
++Checked before writing: the non-blank line sequence is identical before and
++after, so nothing could be lost. Real additions kept in full.
++
++```text
++ggml/src/CMakeLists.txt            632 -> 1265 ->  635
++ggml/src/ggml-cuda/CMakeLists.txt  281 ->  581 ->  303
++ggml/src/ggml-hip/CMakeLists.txt   153 ->  323 ->  174
++ggml/src/ggml-cuda/convert.cu      822 -> 1645 ->  825
++ggml/src/ggml-cuda/dequantize.cuh  481 ->  978 ->  498
++```
++
++Verified after: BUILD_OK, `ggml-base.dll` still carries the turbo3/turbo4 type
++names, qwen2.5-1.5B still answers "Paris", Bonsai unchanged.
++
++## 2026-09-19: `7d103ee` — the integration layer
++
++Source of truth was the verified `fusion/turboquant-on-b10964` branch in the
++llama.cpp clone, applied with `patch --fuzz=3` where the base was close enough and
++hand-ported where it was not. PrismML's base is b10615-era, so several things did
++not exist there and had to be adapted:
++
++* the FA vec dispatch has no `FATTN_VEC_CASES_ALL_D(F16, ...)`-style list of bare
++  type names — it uses fully qualified `GGML_TYPE_*`, and the turbo pairs belong in
++  **both** branches of the `GGML_CUDA_FA_ALL_QUANTS` switch because the instances
++  are compiled unconditionally.
++* there is no `GGML_CUDA_FA_QUANTS` mechanism at all, only `GGML_CUDA_FA_ALL_QUANTS`,
++  so the two CMake hunks that extend the FA_QUANTS default have no counterpart here.
++* there are **7** `build_attn` overloads, not 5, so the WHT-on-q block went in front
++  of all seven rather than the five the older branch patches.
++* `build_attn_mha` has no `ggml_flash_attn_ext_set_n_kv_max` call, so the V-side
++  rotation is anchored after `ggml_flash_attn_ext_set_prec` instead.
++
++Also removed a duplicated FA-instance block that the original port had left behind:
++two `if (GGML_CUDA_FA_ALL_QUANTS)` blocks back to back, the second one omitting the
++turbo instances. It built by luck (CMake dedupes identical sources) but would have
++silently dropped the turbo instances as soon as `FA_ALL_QUANTS` was turned off.
++
++Verification after the port:
++
++```text
++BUILD_OK
++llama-server --help        -> turbo3, turbo4 accepted
++llama-bench -p 256 -n 32 -r 2, qwen2.5-1.5B q8_0:
++    f16 7801.5/174.1   q8_0 7635.8/160.7   turbo3 7449.1/156.5   turbo4 7467.7/151.0
++```
++
++One thing that did not go smoothly and is worth remembering: applying the patch
++with `--fuzz=3` silently mis-placed the `fattn.cu` hunks in the middle of
++`ggml_cuda_get_best_fattn_kernel`, which only surfaced as compile errors. Fuzz on a
++different base is not safe for structural edits; those three hunks were reverted and
++placed by hand.
++
++## 2026-09-19: what the verification turned up
++
++Perplexity on the fusion's own fixture, `-c 512 -fa 1 --chunks 8 -ngl 999`:
++
++| KV | PPL | |
++| --- | --- | --- |
++| f16 | 10.6801 | correct |
++| q8_0 | 329.4764 | broken |
++| turbo3 | 8038.7921 | broken |
++| turbo4 | 4064.1819 | broken |
++
++The `-fa 0` variants of the quantized types abort in `common_fit_params` (VRAM
++fitting), so `-fa 1` is the only runnable configuration for them.
++
++**This is not the port's fault, and it is not a TurboQuant defect either.**
++Running the same q8_0 KV command against the original PrismML build returns
++329.4764 with byte-identical per-chunk values. q8_0 KV has no TurboQuant code in
++it, so quantized KV is already broken on this base.
++
++**And it is not universal.** SC117 (Qwen3.6-35B-A3B) generates identical text with
++q8_0, turbo3 and turbo4 KV on the promoted b10335 runtime, at the same speed. Its
++head dimension is 256; the fixture is 128.
++
++| model | head dim | quantized KV + FA |
++| --- | --- | --- |
++| SC117 (qwen35moe) | 256 | works |
++| ISTA (qwen35) | 256 | works |
++| qwen2.5-1.5B fixture (qwen2) | 128 | broken |
++
++So the accurate statement is **"quantized KV is broken at head_dim 128"**, not
++"turbo KV is broken". This corrects the earlier record on the llama.cpp side, where
++the same measurement was described as a turbo3-specific defect.
++
++## Open items
++
++1. **Bisect quantized KV at D=128 vs D=256.** The fusion's quality fixtures are
++   all head_dim 128, so the gate cannot be evaluated until this is understood.
++   Start with `cpy_ne` / `V_rows_per_thread` in `fattn-vec.cuh`, then the q8_0 path
++   in the same kernel, since q8_0 fails without any TurboQuant code involved.
++2. `mmvq-tq.cu` still not ported (performance only).
++3. The HIP build has `LLAMA_BUILD_TESTS=OFF`, so `ctest -R test-turbo` has not been
++   run here. The tests are wired into `tests/CMakeLists.txt`; a separate
++   test-enabled build is needed to use them as a gate.
++4. `gguf-py/gguf/constants.py` has no entry for the turbo types.

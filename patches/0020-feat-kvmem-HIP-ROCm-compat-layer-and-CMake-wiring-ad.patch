@@ -1,0 +1,287 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] feat(kvmem): HIP/ROCm compat layer and CMake wiring; adapter
+ compiles clean
+
+Build wiring
+- CMakeLists / src/CMakeLists: the LLAMA_KVMEM branch now covers GGML_HIP. On
+  Windows the ROCm build takes ggml-hip's CXX_IS_HIPCC path (CMake on Windows has
+  no HIP language), so the stage-in .cu is compiled as CXX with the ROCm clang++
+  driver and llama-kvmem-cuda-compat.h handles the CUDA -> HIP mapping.
+  find_package(hip) is repeated here because hip::host / hip::device are
+  directory-scoped IMPORTED targets and ggml-hip is a sibling directory.
+- Non-Windows HIP and CPU-only builds fail loudly instead of mislinking.
+
+Adapter ports
+- src/adapter/llama-kvmem-cuda-compat.h (new): 40 CUDA -> HIP name mappings,
+  verified symbol by symbol against the ROCm 7.1 headers. __nv_bfloat16 maps to
+  __hip_bfloat16 and half maps to __half, because AMD HIP provides neither
+  CUDA spelling.
+- llama-kvmem-stagein.cu, llama-kvmem-transfer.h, llama-memory-kvmem.cpp,
+  llama-memory-kvmem-mtp.cpp: cuda_runtime.h / cuda_fp16.h / cuda_bf16.h routed
+  through the shim.
+
+PrismML divergence fixes
+- llama-kv-cache: restore the trailing "const char * name_tag" parameter that the
+  prism branch dropped. KVMem builds a second cache (llama-memory-kvmem-mtp.cpp
+  passes "kvmem-mtp"), so the tensor names have to stay unique; naming is back to
+  the upstream "cache_%sk_l%d" form with name_tag defaulting to "".
+
+Verified: 10/10 kvmem objects compile with 0 errors against the PrismML tree
+(5 adapter .cpp, llama-kvmem-stagein.cu.obj, 4 libkvmem host objects). Full link
+not yet attempted.
+---
+ src/CMakeLists.txt                     | 27 +++++++++
+ src/adapter/llama-kvmem-cuda-compat.h  | 84 ++++++++++++++++++++++++++
+ src/adapter/llama-kvmem-stagein.cu     |  4 ++
+ src/adapter/llama-kvmem-transfer.h     |  4 ++
+ src/adapter/llama-memory-kvmem-mtp.cpp |  4 ++
+ src/adapter/llama-memory-kvmem.cpp     |  4 ++
+ src/llama-kv-cache.cpp                 |  7 ++-
+ src/llama-kv-cache.h                   | 12 ++--
+ 8 files changed, 138 insertions(+), 8 deletions(-)
+ create mode 100644 src/adapter/llama-kvmem-cuda-compat.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 73ea0ba..73bd165 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -80,6 +80,33 @@ if (LLAMA_KVMEM)
+         if (DEFINED CMAKE_CUDA_ARCHITECTURES)
+             set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+         endif()
++    elseif (GGML_HIP)
++        # KVMem's stage-in is CUDA source. On Windows the ROCm build takes the
++        # CXX_IS_HIPCC path (ggml/src/ggml-hip/CMakeLists.txt: "CMake on Windows
++        # doesn't support the HIP language yet"), i.e. ggml compiles its
++        # ../ggml-cuda/*.cu as CXX and the ROCm clang++ driver puts .cu files into
++        # HIP mode by extension. Mirror exactly that: same compiler, same language,
++        # plus llama-kvmem-cuda-compat.h for the CUDA -> HIP name mapping.
++        # A non-Windows HIP build would have to enable the HIP language at the
++        # project root; that is not a configuration llm-stack builds, so fail loudly
++        # instead of producing a confusing link error.
++        if (NOT WIN32)
++            message(FATAL_ERROR
++                "LLAMA_KVMEM=ON with GGML_HIP is only wired for Windows/ROCm builds")
++        endif()
++        set(_kvmem_stagein ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-stagein.cu)
++        set_source_files_properties(${_kvmem_stagein} PROPERTIES LANGUAGE CXX)
++        target_sources(llama PRIVATE ${_kvmem_stagein})
++        target_compile_definitions(llama PRIVATE LLAMA_KVMEM_HIP=1)
++        # hip::host / hip::device are IMPORTED targets created by ggml-hip's
++        # find_package(hip), so they are not visible in this sibling directory.
++        # hip_DIR is already in the cache, so this resolves immediately.
++        find_package(hip REQUIRED)
++        target_link_libraries(llama PRIVATE hip::device hip::host)
++    else()
++        message(FATAL_ERROR
++            "LLAMA_KVMEM=ON requires a GPU backend: KVMem's tiered KV store is staged "
++            "in through the CUDA/HIP stage-in path. Configure with -DGGML_HIP=ON or -DGGML_CUDA=ON.")
+     endif()
+     target_include_directories(llama PRIVATE
+         ${LLAMA_KVMEM_ROOT}/kvmem/include
+diff --git a/src/adapter/llama-kvmem-cuda-compat.h b/src/adapter/llama-kvmem-cuda-compat.h
+new file mode 100644
+index 0000000..3c66cff
+--- /dev/null
++++ b/src/adapter/llama-kvmem-cuda-compat.h
+@@ -0,0 +1,84 @@
++#pragma once
++
++// ---------------------------------------------------------------------------
++// HIP/ROCm compatibility shim for KVMem's CUDA-only GPU stage-in path.
++//
++// KVMem upstream (v0.16.0-rc3) targets CUDA: `llama-kvmem-stagein.cu` and
++// `llama-kvmem-transfer.h` are compiled only when GGML_CUDA is on. llm-stack
++// builds this tree with GGML_HIP=ON (gfx1030 / RX 6900 XT), so the CUDA
++// translation units would otherwise not be built and every `kvmem_stagein_*`
++// symbol referenced from llama-memory-kvmem.cpp would fail to link.
++//
++// The CUDA surface actually used by the adapter is a strict subset of HIP's
++// runtime API. Verified against the vendored sources:
++//   * no __shfl_*, no atomicAdd, no __ldg, no texture/surface objects
++//   * only 25 host-side runtime entry points, all with hip* counterparts
++//   * kernel syntax (<<<>>>, __global__, blockIdx/threadIdx/blockDim) is
++//     identical between CUDA and HIP, so no kernel body needs touching
++// Therefore a name mapping is sufficient — no source fork of the adapter.
++//
++// Included only when LLAMA_KVMEM_HIP is defined (set by src/CMakeLists.txt for
++// GGML_HIP builds). The mappings are deliberately confined to this header so
++// the `cuda*` spellings cannot leak into any other translation unit.
++// ---------------------------------------------------------------------------
++
++#include <hip/hip_runtime.h>
++#include <hip/hip_fp16.h>
++#include <hip/hip_bf16.h>
++
++// --- bfloat16 -------------------------------------------------------------
++// CUDA: `__nv_bfloat16` (cuda_bf16.h). HIP/AMD: `__hip_bfloat16`
++// (hip_bfloat16 is not visible in every ROCm 7.1 translation unit).
++// `__bfloat162float` / `__float2bfloat16` already exist in amd_hip_bf16.h.
++using __nv_bfloat16 = __hip_bfloat16;
++
++// --- fp16 -----------------------------------------------------------------
++// CUDA provides `half` as a synonym for `__half`; HIP does not.
++using half = __half;
++
++// --- runtime API types and enums -----------------------------------------
++#define cudaError_t              hipError_t
++#define cudaSuccess              hipSuccess
++#define cudaMemcpyKind           hipMemcpyKind
++#define cudaMemcpyHostToDevice   hipMemcpyHostToDevice
++#define cudaMemcpyDeviceToHost   hipMemcpyDeviceToHost
++#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
++#define cudaStream_t             hipStream_t
++#define cudaEvent_t              hipEvent_t
++
++// --- runtime API functions ------------------------------------------------
++#define cudaGetErrorString       hipGetErrorString
++#define cudaGetLastError         hipGetLastError
++#define cudaStreamSynchronize    hipStreamSynchronize
++#define cudaEventCreateWithFlags hipEventCreateWithFlags
++#define cudaEventDisableTiming   hipEventDisableTiming
++#define cudaEventRecord          hipEventRecord
++#define cudaEventSynchronize     hipEventSynchronize
++#define cudaEventDestroy         hipEventDestroy
++#define cudaMalloc               hipMalloc
++#define cudaMallocHost           hipHostMalloc
++#define cudaFree                 hipFree
++#define cudaFreeHost             hipHostFree
++#define cudaMemcpy               hipMemcpy
++#define cudaMemcpyAsync          hipMemcpyAsync
++#define cudaMemsetAsync          hipMemsetAsync
++
++// --- device / stream management -------------------------------------------
++#define cudaSetDevice            hipSetDevice
++#define cudaGetDevice            hipGetDevice
++#define cudaDeviceSynchronize    hipDeviceSynchronize
++#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
++#define cudaStreamNonBlocking    hipStreamNonBlocking
++#define cudaStreamDestroy        hipStreamDestroy
++#define cudaStreamWaitEvent      hipStreamWaitEvent
++
++// --- pointer attributes ---------------------------------------------------
++// CUDA spells the struct `cudaPointerAttributes`; HIP spells it
++// `hipPointerAttribute_t` (singular "Attribute"). The field names differ too,
++// but the vendored code only reads .type / .device, which both provide.
++#define cudaPointerAttributes    hipPointerAttribute_t
++#define cudaPointerGetAttributes hipPointerGetAttributes
++
++// hipStreamPerThread is a macro in hip_runtime_api.h; alias it explicitly so
++// the CUDA spelling keeps working.
++#define cudaStreamPerThread      hipStreamPerThread
+diff --git a/src/adapter/llama-kvmem-stagein.cu b/src/adapter/llama-kvmem-stagein.cu
+index 7116ccf..7057727 100644
+--- a/src/adapter/llama-kvmem-stagein.cu
++++ b/src/adapter/llama-kvmem-stagein.cu
+@@ -1,9 +1,13 @@
+ #include "llama-kvmem-stagein.h"
+ #include "llama-kvmem-transfer.h"
+ 
++#if defined(LLAMA_KVMEM_HIP)
++#include "llama-kvmem-cuda-compat.h"
++#else
+ #include <cuda_fp16.h>
+ #include <cuda_bf16.h>
+ #include <cuda_runtime.h>
++#endif
+ 
+ #include <cmath>
+ #include <cstdint>
+diff --git a/src/adapter/llama-kvmem-transfer.h b/src/adapter/llama-kvmem-transfer.h
+index 909960e..3035830 100644
+--- a/src/adapter/llama-kvmem-transfer.h
++++ b/src/adapter/llama-kvmem-transfer.h
+@@ -2,7 +2,11 @@
+ 
+ #include "llama-kvmem-hooks.h"
+ #include "ggml-backend.h"
++#if defined(LLAMA_KVMEM_HIP)
++#include "llama-kvmem-cuda-compat.h"
++#else
+ #include <cuda_runtime.h>
++#endif
+ 
+ // Optional KVMEM_PERF accounting at executed copy call sites, not plan entries.
+ // Native model/backend transfers outside the adapter are deliberately excluded.
+diff --git a/src/adapter/llama-memory-kvmem-mtp.cpp b/src/adapter/llama-memory-kvmem-mtp.cpp
+index 9699db2..6cb104c 100644
+--- a/src/adapter/llama-memory-kvmem-mtp.cpp
++++ b/src/adapter/llama-memory-kvmem-mtp.cpp
+@@ -16,7 +16,11 @@
+ #include "ggml-backend.h"
+ #include "ggml-backend-impl.h"
+ 
++#if defined(LLAMA_KVMEM_HIP)
++#include "llama-kvmem-cuda-compat.h"
++#else
+ #include <cuda_runtime.h>
++#endif
+ 
+ #include <algorithm>
+ #include <cmath>
+diff --git a/src/adapter/llama-memory-kvmem.cpp b/src/adapter/llama-memory-kvmem.cpp
+index 9cc2456..aad4529 100644
+--- a/src/adapter/llama-memory-kvmem.cpp
++++ b/src/adapter/llama-memory-kvmem.cpp
+@@ -24,7 +24,11 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-cuda.h"
+ 
++#if defined(LLAMA_KVMEM_HIP)
++#include "llama-kvmem-cuda-compat.h"
++#else
+ #include <cuda_runtime.h>
++#endif
+ 
+ #include <algorithm>
+ #include <atomic>
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 3391810..06174a8 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
+            llama_memory_t   mem_other,
+     const layer_filter_cb & filter,
+     const  layer_reuse_cb & reuse,
+-    const  layer_share_cb & share) :
++    const  layer_share_cb & share,
++             const char *   name_tag) :
+     model(model), hparams(hparams), v_trans(v_trans),
+     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+     other(static_cast<llama_kv_cache *>(mem_other)),
+@@ -255,8 +256,8 @@ llama_kv_cache::llama_kv_cache(
+         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+ 
+-        has_k && ggml_format_name(k, "cache_k_l%d", il);
+-        has_v && ggml_format_name(v, "cache_v_l%d", il);
++        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
++        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+ 
+         std::vector<ggml_tensor *> k_stream;
+         std::vector<ggml_tensor *> v_stream;
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 6922e7a..bc99501 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -108,11 +108,13 @@ public:
+                      uint32_t   n_seq_max,
+                      uint32_t   n_pad,
+                      uint32_t   n_swa,
+-               llama_swa_type   swa_type,
+-               llama_memory_t   mem_other,
+-        const layer_filter_cb & filter,
+-        const  layer_reuse_cb & reuse,
+-        const  layer_share_cb & share);
++              llama_swa_type   swa_type,
++              llama_memory_t   mem_other,
++       const layer_filter_cb & filter,
++       const  layer_reuse_cb & reuse,
++       const  layer_share_cb & share,
++       // a model can hold more than one cache, so the tensor names have to stay unique
++                const char *   name_tag = "");
+ 
+     ~llama_kv_cache() = default;
+ 

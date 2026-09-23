@@ -1,0 +1,1107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] feat(kvmem): turbo3/turbo4 KV cache types, full support
+
+KVMem can now run its KV tier on the TurboQuant cache types.
+
+Only one of the three gates was actually a kernel problem:
+
+  * tools/kvmem/kvmem-spec.cpp: accept turbo3/turbo3_0/turbo4/turbo4_0 in
+    kvmem_parse_cache_type(), and whitelist both in kvmem_cache_types_ok().
+    --kv-dtype / -ctk / -ctv advertise them, and so does the error string.
+  * The host-side codec needed nothing: kvmem_cache_unpack_rows() already
+    falls through to ggml_get_type_traits(ty)->to_float, and ggml.c routes
+    GGML_TYPE_TURBO3_0/4_0 to quantize_turbo3_0 / dequantize_row_turbo3_0.
+  * src/adapter/llama-kvmem-stagein.cu needed a device codec.
+
+The structural reason this is cheap: the tiered store is type-opaque. GPU
+cache rows move as per-row byte copies (copy_k_gpu -> kvmem_stagein_enqueue_v
+/ _h2d_bytes) inside a row already sized by ggml_row_size(type, n_embd), and
+nothing in kvmem/ or the adapter ever interprets those bytes. turbo3/turbo4
+rows therefore round-trip with no codec at all, and read_gpu_block /
+dump_kv_compare decode through the ggml trait.
+
+The new codec serves the other stage-in shape (kvmem_stagein_enqueue_k),
+which rebuilds a row from values: dequant -> RoPE -> KVMem Hadamard ->
+requantise. For turbo that last step must land byte-for-byte on what
+k_set_rows_turbo3 / k_set_rows_turbo4 would have written, or a restored row
+would not match the rows prefill wrote natively into the same cache.
+
+  * dequant_turbo3 / dequant_turbo4: centroid x block norm.
+  * quant_turbo3_grouped<128|64>: group L2 norm -> signed FWHT -> nearest
+    centroid -> pack 2+1 bits -> reconstruction-corrected norm.
+  * quant_turbo4_grouped: same, one 128-element block, nibble packing,
+    rnorm written as 0.
+  * kvmem_stagein_quant_ok(): widened to both turbo types.
+
+Two deliberate deviations from set-rows.cu:
+
+  * No __shfl_* and no __ballot_*. HIP's wavefront is 64 on GCN and 32 on
+    RDNA and this tree targets gfx1030, so every reduction is a shared-memory
+    tree and the sub-block packing is addressed in shared memory. The result
+    is wavefront-size independent.
+  * The WHT group size comes from head_dim, not the row width:
+    (n_embd_head % 128 == 0) ? 128 : 64, mirroring the op_params that
+    llama-kv-cache.cpp writes. The two rules differ only for head_dim 64 with
+    an even KV head count, where the row-width rule would merge two heads
+    into one group.
+
+tools/kvmem/gen-turbo-tables.py generates llama-kvmem-turbo-{host,device}.h
+from ggml/src/ggml-cuda/turbo-quant.cuh, so the codebooks and the WHT sign
+tables cannot drift from ggml's. The emitter writes 9 significant digits: the
+first cut used .1f, which looked right for the +/-1.0 sign tables but
+collapsed the codebooks (smallest 3-bit centroid 0.021460 -> 0.0).
+
+Verified:
+  --kv-dtype turbo3 -ctk turbo3 -ctv turbo4   accepted; fails only on missing model
+  --kv-dtype turbo3_0                         accepted (alias)
+  --kv-dtype turbo9                           unsupported cache type (...|turbo3|turbo4)
+  gen-turbo-tables.py --check                 turbo tables up to date
+  ninja llama-server llama-kvmem-server       NINJA_RC=0
+
+Not proven: the device codec compiled but never ran. This sandbox has no ROCm
+device, and kvmem_stagein_enqueue_k has no caller - the live stage-in is
+write_block_to_gpu(), which copies raw rows. So what carries turbo3/4 at
+runtime is the type-opaque byte path; the kernels are compile-verified only.
+
+Refs docs/kvmem/FUSION-NOTES.md, section "TurboQuant KV types".
+---
+ docs/kvmem/FUSION-NOTES.md             | 120 ++++++--
+ src/adapter/llama-kvmem-stagein.cu     | 365 ++++++++++++++++++++++++-
+ src/adapter/llama-kvmem-stagein.h      |  16 +-
+ src/adapter/llama-kvmem-turbo-device.h |  74 +++++
+ src/adapter/llama-kvmem-turbo-host.h   |  74 +++++
+ tools/kvmem/gen-turbo-tables.py        | 159 +++++++++++
+ tools/kvmem/kvmem-spec.cpp             |  18 +-
+ tools/kvmem/llama-kvmem-cli.cpp        |   8 +-
+ tools/kvmem/llama-kvmem-server.cpp     |   8 +-
+ 9 files changed, 808 insertions(+), 34 deletions(-)
+ create mode 100644 src/adapter/llama-kvmem-turbo-device.h
+ create mode 100644 src/adapter/llama-kvmem-turbo-host.h
+ create mode 100644 tools/kvmem/gen-turbo-tables.py
+
+diff --git a/docs/kvmem/FUSION-NOTES.md b/docs/kvmem/FUSION-NOTES.md
+index 43e2ba1..953b80a 100644
+--- a/docs/kvmem/FUSION-NOTES.md
++++ b/docs/kvmem/FUSION-NOTES.md
+@@ -19,7 +19,7 @@ the root provides both `src/adapter/` and `kvmem/`.
+ | `src/adapter/` | 16 files, the integration layer. `llama-memory-kvmem.cpp` (143 KB) is the tiered store; `-mtp` and `-hybrid` are the MTP and hybrid-SSM variants |
+ | `kvmem/` | Host-only portable library (`libkvmem`): store, runtime, raw store, RoPE. NVMe tier is POSIX-only and auto-disables on Windows |
+ | `patches/kvmem/` | The upstream patch plus its historical predecessors, kept for provenance |
+-| `tools/kvmem/` | KVMem's own server/CLI (`llama-kvmem-server.cpp`, `llama-kvmem-cli.cpp`), the KVMem-only headers and the lightweight web UI. **These are the only entry point to the adapter** — see below |
++| `tools/kvmem/` | KVMem's own server/CLI (`llama-kvmem-server.cpp`, `llama-kvmem-cli.cpp`), the KVMem-only headers and the lightweight web UI. **These are the only entry point to the adapter** — see below. Also `gen-turbo-tables.py`, the TurboQuant constant emitter |
+ | `tests/kvmem/`, `docs/kvmem/` | Upstream tests and design/milestone docs |
+ 
+ ## Patch replay
+@@ -93,6 +93,85 @@ Two things assumed by the vendored sources exist only in the pinned base
+    semantics). It also had to include `mtmd-helper.h` explicitly, because the newer
+    `server-common.h` re-exports it and this one does not.
+ 
++## TurboQuant KV types (`turbo3` / `turbo4`)
++
++KVMem can run its KV tier on the TurboQuant cache types. Three things had to
++line up, and only one of them was actually about kernels:
++
++1. **Flag parsing** — `kvmem_parse_cache_type()` (`tools/kvmem/kvmem-spec.cpp`)
++   now accepts `turbo3` / `turbo3_0` / `turbo4` / `turbo4_0`, and
++   `kvmem_cache_types_ok()` whitelists both types. `--kv-dtype`, `-ctk` and
++   `-ctv` advertise them; the rejection message lists them too.
++2. **Host-side codec** — nothing to do. `kvmem_cache_unpack_rows()` falls through
++   to `ggml_get_type_traits(ty)->to_float`, and `ggml.c` routes
++   `GGML_TYPE_TURBO3_0/4_0` to `quantize_turbo3_0` / `dequantize_row_turbo3_0`.
++3. **Device stage-in codec** — `src/adapter/llama-kvmem-stagein.cu`.
++
++The structural point that makes this cheap: **the tiered store is type-opaque**.
++GPU cache rows move as per-row byte copies — `RawKvStore::copy_k_gpu` →
++`kvmem_stagein_enqueue_v` / `kvmem_stagein_h2d_bytes` — inside a row already sized
++by `ggml_row_size(type, n_embd)`. Nothing in `kvmem/` or the adapter interprets
++those bytes. So turbo3/turbo4 rows round-trip through the tier with no codec at
++all, and `read_gpu_block` / `dump_kv_compare` decode through the ggml trait.
++
++The codec added to `llama-kvmem-stagein.cu` serves the *other* stage-in shape
++(`kvmem_stagein_enqueue_k`), which rebuilds a row from values: dequantise to f32
++→ RoPE → KVMem's Hadamard → re-quantise. For turbo types that last step has to
++reproduce ggml's `k_set_rows_turbo3` / `k_set_rows_turbo4` byte-for-byte,
++otherwise a rebuilt row would not match the rows prefill wrote natively into the
++same cache.
++
++| Added | Notes |
++|---|---|
++| `dequant_turbo3` / `dequant_turbo4` | centroid × block norm, matching `dequantize_row_turbo3_0` / `_turbo4_0` |
++| `quant_turbo3_grouped<128\|64>` | group L2 norm → signed FWHT → nearest centroid → pack 2+1 bits → reconstruction-corrected norm |
++| `quant_turbo4_grouped` | same, one 128-element block, nibble packing, `rnorm` written as 0 |
++| `kvmem_stagein_quant_ok` | widened to the two turbo types |
++
++Two deliberate deviations from `set-rows.cu`:
++
++- **No `__shfl_*`, no `__ballot_*`.** HIP's wavefront is 64 on GCN and 32 on RDNA
++  and this tree targets gfx1030, so every reduction is a shared-memory tree and
++  the sub-block packing is addressed in shared memory. The result does not depend
++  on wavefront size.
++- **The WHT group size comes from `head_dim`, not the row width** —
++  `(n_embd_head % 128 == 0) ? 128 : 64`, mirroring the `op_params` written by
++  `llama-kv-cache.cpp:1415`. For head_dim 128 (the 27B case) the two rules agree;
++  they differ only for head_dim 64 with an even KV head count, where the
++  row-width rule would merge two heads into one group.
++
++`tools/kvmem/gen-turbo-tables.py` generates
++`src/adapter/llama-kvmem-turbo-{host,device}.h` from
++`ggml/src/ggml-cuda/turbo-quant.cuh`, so the codebooks and the WHT sign tables
++cannot drift from ggml's. `--check` asserts the generated files are current.
++
++Verified on `llama-kvmem-server.exe`:
++
++| Check | Result |
++|---|---|
++| `--kv-dtype turbo3 -ctk turbo3 -ctv turbo4` | accepted, then `KVMEM_STARTUP_ERROR missing model` |
++| `--kv-dtype turbo3_0` | accepted (alias) |
++| `--kv-dtype turbo9` | `unsupported cache type (want f16\|f32\|q8_0\|q5_0\|q4_0\|turbo3\|turbo4)` |
++| `gen-turbo-tables.py --check` | `turbo tables up to date` |
++
++### What is *not* proven
++
++The device codec compiled but never ran. This sandbox has no ROCm device, and
++`kvmem_stagein_enqueue_k` currently has **no caller**: the live stage-in is
++`write_block_to_gpu()`, which copies raw rows through `kvmem_stagein_enqueue_v` /
++`kvmem_stagein_h2d_bytes`. So the turbo kernels are compile-verified only, and
++what actually carries turbo3/turbo4 at runtime is the type-opaque byte path.
++
++First real check, on the user's own terminal:
++
++```bash
++llama-kvmem-server -m <head_dim-128 model> --kv-dtype turbo3 -ngl 99
++```
++
++A head_dim-128 model is required: `llama-kv-cache.cpp:214-233` silently falls the
++cache back to `q8_0` (with a warning on layer 0) if turbo3 gets head_dim % 64,
++or turbo4 head_dim % 128.
++
+ ## HIP / ROCm
+ 
+ KVMem's GPU stage-in (`llama-kvmem-stagein.cu`, 1073 lines, 10 kernels) is
+@@ -140,6 +219,14 @@ Three traps are worth knowing:
+    directory to `PATH`. Without it any *new* `.cu` fails with
+    `unable to execute command: program not executable` / `amdgcn-link command failed`.
+    Existing object files mask the problem because ninja does not rebuild them.
++4. **`llama-server` depends on `llama-ui-assets`, which needs the network.**
++   `scripts/ui-assets.cmake` tries `huggingface.co/ggml-org/llama-ui` and, on
++   failure, only warns and emits an empty UI — which is fine, and is the normal
++   state of this host. It stops being fine if a previous attempt left a 0-byte
++   `build-hip/tools/ui/dist.tar.gz`: the script then treats it as an archive and
++   dies with a bare non-zero exit and no message. `rm` it and re-run. Note the
++   KVMem targets do **not** depend on the UI target, so
++   `ninja llama-kvmem-server` is unaffected either way.
+ 
+ ```bash
+ # after exporting the ROCm/MSVC environment and the lld-compat PATH
+@@ -160,9 +247,12 @@ which now also prepends the lld-compat directory and passes `-DLLAMA_KVMEM=ON`.
+ - Configure: green. `libkvmem` (static), the five adapter objects and
+   `llama-kvmem-stagein.cu.obj` are all in the ninja graph.
+ - Compile: 10/10 kvmem objects, 0 errors, against the prism tree.
+-- **`llama-server.exe`: links, `NINJA_RC=0`, 282/282 targets.**
+-- **`llama-kvmem-server.exe`: links (1.86 MB).** Runs; `--help` prints the full
+-  `--kvmem*` surface, so the adapter is reachable from the command line.
++- **`llama-server.exe`: links, `NINJA_RC=0`.** Rebuilt after the turbo codec
++  landed, so the `bin/llama.dll` it loads (3 578 368 B) carries it.
++- **`llama-kvmem-server.exe`: links (1 858 560 B), `NINJA_RC=0`.** Runs; `--help`
++  prints the full `--kvmem*` surface, so the adapter is reachable from the
++  command line.
++- **TurboQuant cache types: accepted end to end** (see the section above).
+ - Device enumeration could not be checked in-sandbox: `--list-devices` reports
+   "no ROCm-capable device is detected" for the *pre-existing* `llama-server.exe`
+   and `llama-cli.exe` too, i.e. the sandbox has no GPU access. Must be re-checked
+@@ -170,25 +260,9 @@ which now also prepends the lld-compat directory and passes `-DLLAMA_KVMEM=ON`.
+ 
+ ## Not done
+ 
+-- **`turbo3` / `turbo4` cannot be used as the KV cache type in the KVMem tools,
+-  and this is a kernel port, not a flag change.** Two gates and one real blocker:
+-  1. `kvmem_parse_cache_type()` (`tools/kvmem/kvmem-spec.cpp`) accepts only
+-     `f16|f32|q8_0|q5_0|q4_0`, and `kvmem_cache_types_ok()` gates quantized types
+-     to `{q8_0, q5_0, q4_0}`.
+-  2. The host-side codec would cope: `kvmem_cache_pack_rows()` falls through to
+-     `ggml_quantize_chunk()`, and `ggml.c:8155` has a real
+-     `case GGML_TYPE_TURBO3_0: quantize_turbo3_0(...)`, with
+-     `dequantize_row_turbo3_0` providing `to_float` for the unpack direction.
+-  3. **`kvmem_stagein_quantize()` (`src/adapter/llama-kvmem-stagein.cu:583`)
+-     returns false for every type except `Q8_0` and `Q4_0`.** The stage-in path
+-     dequantises stored raw-K, applies RoPE (and FWHT) on device and then
+-     re-quantises into the cache tensor; there is no turbo quantiser kernel, and
+-     TURBO3_0's codec is grouped on 128 elements (`QK_TURBO3_GROUP`), so it is not
+-     a drop-in for the existing per-block kernels.
+-
+-  Net: KVMem today runs `f16` or `q8_0`/`q5_0`/`q4_0` KV. Pairing it with
+-  TurboQuant KV means writing `quant_turbo3_0` / `quant_turbo4_0` device kernels
+-  (including the grouped WHT) and extending both allow-lists.
++- ~~`turbo3` / `turbo4` cannot be used as the KV cache type in the KVMem tools.~~
++  Done — see "TurboQuant KV types" above. The device codec is compile-verified
++  only; a real run on a head_dim-128 model still has to be done by hand.
+ - KVMem's lightweight web UI (`tools/kvmem/ui/`) is served from `--ui-dir`; the
+   bundled copy in `kvmem-webui.h` is what actually ships.
+ - Five `kvmem_*_test` executables are defined by `kvmem/CMakeLists.txt` but are
+diff --git a/src/adapter/llama-kvmem-stagein.cu b/src/adapter/llama-kvmem-stagein.cu
+index 7057727..0c21704 100644
+--- a/src/adapter/llama-kvmem-stagein.cu
++++ b/src/adapter/llama-kvmem-stagein.cu
+@@ -1,6 +1,11 @@
+ #include "llama-kvmem-stagein.h"
+ #include "llama-kvmem-transfer.h"
+ 
++// TurboQuant codebooks and WHT sign tables, generated from
++// ggml/src/ggml-cuda/turbo-quant.cuh by tools/kvmem/gen-turbo-tables.py.
++// Regenerate with: python tools/kvmem/gen-turbo-tables.py --root .
++#include "llama-kvmem-turbo-device.h"
++
+ #if defined(LLAMA_KVMEM_HIP)
+ #include "llama-kvmem-cuda-compat.h"
+ #else
+@@ -33,6 +38,28 @@ struct __align__(2) block_q4_0 {
+ static_assert(sizeof(block_q8_0) == 34, "q8_0 block");
+ static_assert(sizeof(block_q4_0) == 18, "q4_0 block");
+ 
++// TurboQuant block layouts, mirrored from ggml/src/ggml-common.h. They are
++// redeclared here rather than included because ggml-common.h is a CUDA/HIP
++// header full of backend macros; the sizes are static_asserted below, so a
++// drift breaks the build instead of silently corrupting the cache.
++constexpr int QK_TURBO3 = 32;
++constexpr int QK_TURBO4 = 128;
++
++struct __align__(2) block_turbo3_0 {
++    half    norm;
++    uint8_t qs[QK_TURBO3 / 4];      // lower 2 bits of each 3-bit index
++    uint8_t signs[QK_TURBO3 / 8];   // upper bit of each 3-bit index
++};
++
++struct __align__(2) block_turbo4_0 {
++    half    norm;
++    half    rnorm;                  // reserved, written as 0 by ggml
++    uint8_t qs[QK_TURBO4 / 2];
++};
++
++static_assert(sizeof(block_turbo3_0) == 14, "turbo3 block");
++static_assert(sizeof(block_turbo4_0) == 68, "turbo4 block");
++
+ constexpr size_t SLAB = (size_t) 32 * 1024 * 1024;
+ constexpr int GATHER_MAX = 8192;
+ 
+@@ -236,6 +263,286 @@ __global__ void quant_q4_0(const float * x, block_q4_0 * y, int64_t n_blocks) {
+     }
+ }
+ 
++// --- TurboQuant cache types -------------------------------------------------
++//
++// KVMem's tiered store treats GPU cache rows as opaque bytes: eviction and
++// restore are copy_k_gpu / copy_v_gpu / kvmem_stagein_h2d_bytes, so turbo3 and
++// turbo4 already round-trip without any codec of ours. The kernels below only
++// serve the slab stage-in path (kvmem_stagein_enqueue_k), which decodes a stored
++// row back to f32, RoPEs it, rotates it and re-encodes it into the live cache.
++//
++// That path must land byte-for-byte on what ggml's own k_set_rows_turbo3 /
++// k_set_rows_turbo4 would have written, otherwise a restored row would not match
++// the rows prefill wrote natively into the same cache. So the algorithm is a
++// straight port of ggml/src/ggml-cuda/set-rows.cu and the constants come from
++// the generated header rather than being retyped here.
++//
++// Difference from set-rows.cu: no __shfl_* and no __ballot_*. HIP's wavefront is
++// 64 on GCN and 32 on RDNA, and this tree builds for gfx1030, so every reduction
++// is a shared-memory tree and the sub-block packing is done by addressing shared
++// memory directly. Same result, wavefront-size independent.
++
++__device__ __forceinline__ uint8_t turbo_nearest_3bit(float val) {
++    if      (val < TURBO_MID_3BIT[0]) return 0;
++    else if (val < TURBO_MID_3BIT[1]) return 1;
++    else if (val < TURBO_MID_3BIT[2]) return 2;
++    else if (val < TURBO_MID_3BIT[3]) return 3;
++    else if (val < TURBO_MID_3BIT[4]) return 4;
++    else if (val < TURBO_MID_3BIT[5]) return 5;
++    else if (val < TURBO_MID_3BIT[6]) return 6;
++    else                              return 7;
++}
++
++__device__ __forceinline__ uint8_t turbo_nearest_4bit(float val) {
++    if      (val < TURBO_MID_4BIT[ 0]) return  0;
++    else if (val < TURBO_MID_4BIT[ 1]) return  1;
++    else if (val < TURBO_MID_4BIT[ 2]) return  2;
++    else if (val < TURBO_MID_4BIT[ 3]) return  3;
++    else if (val < TURBO_MID_4BIT[ 4]) return  4;
++    else if (val < TURBO_MID_4BIT[ 5]) return  5;
++    else if (val < TURBO_MID_4BIT[ 6]) return  6;
++    else if (val < TURBO_MID_4BIT[ 7]) return  7;
++    else if (val < TURBO_MID_4BIT[ 8]) return  8;
++    else if (val < TURBO_MID_4BIT[ 9]) return  9;
++    else if (val < TURBO_MID_4BIT[10]) return 10;
++    else if (val < TURBO_MID_4BIT[11]) return 11;
++    else if (val < TURBO_MID_4BIT[12]) return 12;
++    else if (val < TURBO_MID_4BIT[13]) return 13;
++    else if (val < TURBO_MID_4BIT[14]) return 14;
++    else                               return 15;
++}
++
++__global__ void dequant_turbo3(const block_turbo3_0 * x, float * y, int64_t n_blocks) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_blocks) {
++        return;
++    }
++    const float norm = __half2float(x[i].norm);
++#pragma unroll
++    for (int j = 0; j < QK_TURBO3; ++j) {
++        const uint8_t low2 = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
++        const uint8_t hi1  = (x[i].signs[j / 8] >> (j % 8)) & 0x1;
++        y[i * QK_TURBO3 + j] = TURBO_CENTROIDS_3BIT[low2 | (hi1 << 2)] * norm;
++    }
++}
++
++__global__ void dequant_turbo4(const block_turbo4_0 * x, float * y, int64_t n_blocks) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_blocks) {
++        return;
++    }
++    const float norm = __half2float(x[i].norm);
++#pragma unroll
++    for (int j = 0; j < QK_TURBO4; ++j) {
++        const uint8_t idx = (x[i].qs[j / 2] >> ((j % 2) * 4)) & 0xF;
++        y[i * QK_TURBO4 + j] = TURBO_CENTROIDS_4BIT[idx] * norm;
++    }
++}
++
++// One thread block per WHT group. GROUP has to match the size ggml records in
++// the cache op_params: (head_dim % 128 == 0) ? 128 : 64. Every group is
++// 32-element storage blocks, so GROUP / QK_TURBO3 sub-blocks share one L2 norm
++// and one reconstruction-corrected scale factor, exactly as in set-rows.cu.
++template <int GROUP>
++__global__ void quant_turbo3_grouped(const float * __restrict__ src,
++                                     block_turbo3_0 * __restrict__ dst,
++                                     int64_t n_groups) {
++    static_assert(GROUP == 128 || GROUP == 64, "turbo3 group must be 128 or 64");
++    constexpr int N_SUB = GROUP / QK_TURBO3;   // 32-element storage blocks
++    constexpr int N_QS  = QK_TURBO3 / 4;      // qs bytes per sub-block
++    constexpr int N_SG  = QK_TURBO3 / 8;      // sign bytes per sub-block
++    constexpr float INV_SQRT_GROUP = (GROUP == 128) ? 0.08838834764831845f : 0.125f;
++
++    const int j = threadIdx.x;
++    const int64_t g = blockIdx.x;
++    if (g >= n_groups) {
++        return;
++    }
++
++    __shared__ float   s_x[GROUP];
++    __shared__ float   s_red[GROUP];
++    __shared__ float   s_scale;
++    __shared__ uint8_t s_idx[GROUP];
++
++    const float v = src[g * GROUP + j];
++
++    // ---- group L2 norm -----------------------------------------------------
++    s_red[j] = v * v;
++    for (int h = GROUP / 2; h > 0; h >>= 1) {
++        __syncthreads();
++        if (j < h) {
++            s_red[j] += s_red[j + h];
++        }
++    }
++    __syncthreads();
++    if (j == 0) {
++        const float grp_norm = sqrtf(s_red[0]);
++        s_red[0] = grp_norm;
++        s_scale  = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
++    }
++    __syncthreads();
++    const float grp_norm = s_red[0];
++    const float inv_norm = s_scale;
++
++    // ---- normalize, then signed FWHT: signs1 -> butterfly -> signs2 --------
++    s_x[j] = v * inv_norm * TURBO_WHT_SIGNS1[j];
++    __syncthreads();
++
++#define KVMEM_WHT_STAGE(h)                              \
++    if (j % (2 * (h)) < (h)) {                          \
++        const float a = s_x[j];                         \
++        const float b = s_x[j + (h)];                   \
++        s_x[j]         = a + b;                         \
++        s_x[j + (h)]   = a - b;                         \
++    }                                                   \
++    __syncthreads();
++
++    KVMEM_WHT_STAGE(1)
++    KVMEM_WHT_STAGE(2)
++    KVMEM_WHT_STAGE(4)
++    KVMEM_WHT_STAGE(8)
++    KVMEM_WHT_STAGE(16)
++    KVMEM_WHT_STAGE(32)
++    if (GROUP == 128) {
++        KVMEM_WHT_STAGE(64)
++    }
++#undef KVMEM_WHT_STAGE
++
++    const float        rv  = s_x[j] * INV_SQRT_GROUP * TURBO_WHT_SIGNS2[j];
++    const uint8_t      idx = turbo_nearest_3bit(rv);
++    s_idx[j] = idx;
++    __syncthreads();
++
++    // ---- pack the 3-bit indices: 4 per qs byte, 8 per sign byte ------------
++    block_turbo3_0 * grp = dst + g * N_SUB;
++    if (j < GROUP / 4) {
++        const int sb = j / N_QS;
++        const int qb = j % N_QS;
++        uint8_t byte = 0;
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            byte |= (uint8_t) ((s_idx[sb * QK_TURBO3 + qb * 4 + k] & 0x3) << (k * 2));
++        }
++        grp[sb].qs[qb] = byte;
++    }
++    if (j < GROUP / 8) {
++        const int sb = j / N_SG;
++        const int gb = j % N_SG;
++        uint8_t byte = 0;
++#pragma unroll
++        for (int k = 0; k < 8; ++k) {
++            byte |= (uint8_t) (((s_idx[sb * QK_TURBO3 + gb * 8 + k] >> 2) & 0x1) << k);
++        }
++        grp[sb].signs[gb] = byte;
++    }
++
++    // ---- reconstruction norm: grp_norm / ||centroids||, shared by all N_SUB -
++    const float c = TURBO_CENTROIDS_3BIT[idx];
++    s_red[j] = c * c;
++    for (int h = GROUP / 2; h > 0; h >>= 1) {
++        __syncthreads();
++        if (j < h) {
++            s_red[j] += s_red[j + h];
++        }
++    }
++    __syncthreads();
++    if (j == 0) {
++        const float recon_norm = sqrtf(s_red[0]);
++        s_scale = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
++    }
++    __syncthreads();
++    if (j % QK_TURBO3 == 0) {
++        grp[j / QK_TURBO3].norm = __float2half(s_scale);
++    }
++}
++
++// Turbo4 has a single 128-element group per storage block, so there is no
++// sub-block scale sharing and no group-size option.
++__global__ void quant_turbo4_grouped(const float * __restrict__ src,
++                                     block_turbo4_0 * __restrict__ dst,
++                                     int64_t n_groups) {
++    constexpr float INV_SQRT_128 = 0.08838834764831845f;
++
++    const int j = threadIdx.x;
++    const int64_t g = blockIdx.x;
++    if (g >= n_groups) {
++        return;
++    }
++
++    __shared__ float   s_x[QK_TURBO4];
++    __shared__ float   s_red[QK_TURBO4];
++    __shared__ float   s_scale;
++    __shared__ uint8_t s_idx[QK_TURBO4];
++
++    const float v = src[g * QK_TURBO4 + j];
++
++    s_red[j] = v * v;
++#pragma unroll
++    for (int h = QK_TURBO4 / 2; h > 0; h >>= 1) {
++        __syncthreads();
++        if (j < h) {
++            s_red[j] += s_red[j + h];
++        }
++    }
++    __syncthreads();
++    if (j == 0) {
++        const float grp_norm = sqrtf(s_red[0]);
++        s_red[0] = grp_norm;
++        s_scale  = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
++    }
++    __syncthreads();
++    const float grp_norm = s_red[0];
++    const float inv_norm = s_scale;
++
++    s_x[j] = v * inv_norm * TURBO_WHT_SIGNS1[j];
++    __syncthreads();
++
++#define KVMEM_WHT4_STAGE(h)                             \
++    if (j % (2 * (h)) < (h)) {                          \
++        const float a = s_x[j];                         \
++        const float b = s_x[j + (h)];                   \
++        s_x[j]         = a + b;                         \
++        s_x[j + (h)]   = a - b;                         \
++    }                                                   \
++    __syncthreads();
++
++    KVMEM_WHT4_STAGE(1)
++    KVMEM_WHT4_STAGE(2)
++    KVMEM_WHT4_STAGE(4)
++    KVMEM_WHT4_STAGE(8)
++    KVMEM_WHT4_STAGE(16)
++    KVMEM_WHT4_STAGE(32)
++    KVMEM_WHT4_STAGE(64)
++#undef KVMEM_WHT4_STAGE
++
++    const float        rv  = s_x[j] * INV_SQRT_128 * TURBO_WHT_SIGNS2[j];
++    const uint8_t      idx = turbo_nearest_4bit(rv);
++    s_idx[j] = idx;
++    __syncthreads();
++
++    block_turbo4_0 * blk = dst + g;
++    if (j < QK_TURBO4 / 2) {
++        blk->qs[j] = (uint8_t) (s_idx[2 * j] | (s_idx[2 * j + 1] << 4));
++    }
++
++    const float c = TURBO_CENTROIDS_4BIT[idx];
++    s_red[j] = c * c;
++#pragma unroll
++    for (int h = QK_TURBO4 / 2; h > 0; h >>= 1) {
++        __syncthreads();
++        if (j < h) {
++            s_red[j] += s_red[j + h];
++        }
++    }
++    __syncthreads();
++    if (j == 0) {
++        const float recon_norm = sqrtf(s_red[0]);
++        const float corrected  = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
++        blk->norm  = __float2half(corrected);
++        blk->rnorm = __float2half(0.0f);
++    }
++}
++
+ __global__ void copy_bytes(const CopyOp * ops, int n) {
+     const int i = (int) blockIdx.x;
+     if (i >= n) {
+@@ -491,6 +798,26 @@ static bool dequant_from(ggml_type ty, const void * src, int64_t n_rows, int64_t
+                 static_cast<const block_q4_0 *>(src), g_st.dev_f32, n_blocks);
+         return cuda_ok(cudaGetLastError(), "dequant q4_0");
+     }
++    if (ty == GGML_TYPE_TURBO3_0) {
++        if (n_embd % QK_TURBO3 != 0) {
++            return false;
++        }
++        const int64_t n_blocks = n_rows * (n_embd / QK_TURBO3);
++        const int blocks = (int) ((n_blocks + threads - 1) / threads);
++        dequant_turbo3<<<blocks, threads, 0, stream()>>>(
++                static_cast<const block_turbo3_0 *>(src), g_st.dev_f32, n_blocks);
++        return cuda_ok(cudaGetLastError(), "dequant turbo3");
++    }
++    if (ty == GGML_TYPE_TURBO4_0) {
++        if (n_embd % QK_TURBO4 != 0) {
++            return false;
++        }
++        const int64_t n_blocks = n_rows * (n_embd / QK_TURBO4);
++        const int blocks = (int) ((n_blocks + threads - 1) / threads);
++        dequant_turbo4<<<blocks, threads, 0, stream()>>>(
++                static_cast<const block_turbo4_0 *>(src), g_st.dev_f32, n_blocks);
++        return cuda_ok(cudaGetLastError(), "dequant turbo4");
++    }
+     return false;
+ }
+ 
+@@ -580,10 +907,44 @@ bool kvmem_stagein_fwht(int64_t n_rows, int64_t n_embd, int nrot) {
+     return cuda_ok(cudaGetLastError(), "fwht launch");
+ }
+ 
+-bool kvmem_stagein_quantize(ggml_type ty, void * gpu_dst, int64_t n_rows, int64_t n_embd) {
++bool kvmem_stagein_quantize(ggml_type ty, void * gpu_dst, int64_t n_rows, int64_t n_embd,
++                            int n_embd_head) {
+     if (!g_st.dev_f32 || !gpu_dst || n_rows <= 0 || n_embd <= 0) {
+         return false;
+     }
++    if (ty == GGML_TYPE_TURBO3_0) {
++        // Group size follows head_dim, not the row width: that is what
++        // llama-kv-cache.cpp puts in the cache op_params, and matching it is
++        // what makes a restored row identical to a natively written one.
++        const int group = (n_embd_head % 128 == 0) ? 128 : 64;
++        if (n_embd_head <= 0 || (n_embd_head % 64) != 0 || (n_embd % group) != 0) {
++            return false;
++        }
++        const int64_t n_groups = n_rows * (n_embd / group);
++        if (n_groups <= 0 || n_groups > 0x7fffffff) {
++            return false;
++        }
++        if (group == 128) {
++            quant_turbo3_grouped<128><<<(int) n_groups, 128, 0, stream()>>>(
++                    g_st.dev_f32, static_cast<block_turbo3_0 *>(gpu_dst), n_groups);
++        } else {
++            quant_turbo3_grouped<64><<<(int) n_groups, 64, 0, stream()>>>(
++                    g_st.dev_f32, static_cast<block_turbo3_0 *>(gpu_dst), n_groups);
++        }
++        return cuda_ok(cudaGetLastError(), "turbo3 launch");
++    }
++    if (ty == GGML_TYPE_TURBO4_0) {
++        if (n_embd_head <= 0 || (n_embd_head % QK_TURBO4) != 0 || (n_embd % QK_TURBO4) != 0) {
++            return false;
++        }
++        const int64_t n_groups = n_rows * (n_embd / QK_TURBO4);
++        if (n_groups <= 0 || n_groups > 0x7fffffff) {
++            return false;
++        }
++        quant_turbo4_grouped<<<(int) n_groups, QK_TURBO4, 0, stream()>>>(
++                g_st.dev_f32, static_cast<block_turbo4_0 *>(gpu_dst), n_groups);
++        return cuda_ok(cudaGetLastError(), "turbo4 launch");
++    }
+     const int threads = 256;
+     if (ty == GGML_TYPE_Q8_0) {
+         if (n_embd % QK8_0 != 0) {
+@@ -742,7 +1103,7 @@ bool kvmem_stagein_flush(int64_t * copy_us, int64_t * rope_us,
+         }
+         {
+             const int64_t t0 = ggml_time_us();
+-            ok = kvmem_stagein_quantize(it.ty, it.dst, it.nt, it.n_embd);
++            ok = kvmem_stagein_quantize(it.ty, it.dst, it.nt, it.n_embd, it.n_embd_head);
+             if (set_us) {
+                 *set_us += ggml_time_us() - t0;
+             }
+diff --git a/src/adapter/llama-kvmem-stagein.h b/src/adapter/llama-kvmem-stagein.h
+index bf7e407..3732ccf 100644
+--- a/src/adapter/llama-kvmem-stagein.h
++++ b/src/adapter/llama-kvmem-stagein.h
+@@ -1,8 +1,16 @@
+ #pragma once
+ 
+ // GPU stage-in for quantized raw-K:
+-//   H2D packed q8/q4 → dequant F32 → NeoX RoPE → Walsh-Hadamard → quant into cache.
++//   H2D packed q8/q4/turbo → dequant F32 → NeoX RoPE → Walsh-Hadamard → quant into cache.
+ // F32-H2D path remains for fallback / unrotated V. Host Hadamard/RoPE is fallback only.
++//
++// turbo3/turbo4 are fully supported by the codec below. Note that the ordinary
++// tiered store never needs it: eviction/restore copy cache rows as opaque bytes
++// (copy_k_gpu -> kvmem_stagein_h2d_bytes), so turbo rows round-trip untouched.
++// The codec matters when a row is rebuilt from its values rather than copied,
++// i.e. the kvmem_stagein_enqueue_k slab path. It reproduces ggml's own
++// k_set_rows_turbo3 / k_set_rows_turbo4 byte-for-byte, so a rebuilt row is
++// indistinguishable from a natively written one.
+ 
+ #include "ggml.h"
+ 
+@@ -22,7 +30,11 @@ bool kvmem_stagein_dequant(ggml_type ty, int64_t n_rows, int64_t n_embd);
+ bool kvmem_stagein_rope_neox(int64_t n_tokens, int n_head, int n_embd_head, int n_rot,
+                              int32_t pos0, const float * theta, int n_theta);
+ bool kvmem_stagein_fwht(int64_t n_rows, int64_t n_embd, int nrot);
+-bool kvmem_stagein_quantize(ggml_type ty, void * gpu_dst, int64_t n_rows, int64_t n_embd);
++// n_embd is one full cache row (n_head * n_embd_head). n_embd_head picks the
++// turbo3 WHT group size, mirroring the op_params llama-kv-cache.cpp sets; it is
++// ignored by the non-turbo types and may be 0 for them.
++bool kvmem_stagein_quantize(ggml_type ty, void * gpu_dst, int64_t n_rows, int64_t n_embd,
++                            int n_embd_head);
+ bool kvmem_stagein_h2d_bytes(void * gpu_dst, const void * host, size_t n);
+ void kvmem_stagein_sync();
+ 
+diff --git a/src/adapter/llama-kvmem-turbo-device.h b/src/adapter/llama-kvmem-turbo-device.h
+new file mode 100644
+index 0000000..e46b9bb
+--- /dev/null
++++ b/src/adapter/llama-kvmem-turbo-device.h
+@@ -0,0 +1,74 @@
++// GENERATED FILE -- do not edit.
++// Source : ggml/src/ggml-cuda/turbo-quant.cuh
++// Emitter: tools/kvmem/gen-turbo-tables.py
++//
++// TurboQuant constants, copied verbatim from ggml's own CUDA codec so the KVMem
++// stage-in cannot drift away from the kernels that write the cache natively.
++//
++//   CENTROIDS_* / MID_*  Lloyd-Max codebooks and their decision boundaries
++//   WHT_SIGNS1/2         signed-FWHT sign stages. The forward transform is
++//                            x -> s2 * FWHT(x * s1) / sqrt(group)
++//                        (turbo_rotate_forward in turbo-quant.cuh). The
++//                        butterfly is orthonormal, so the inverse swaps the two
++//                        sign stages.
++//
++// Only the 128-entry WHT tables live here: the 64-element group uses their first
++// 64 entries, exactly as the CUDA and CPU codecs do.
++
++#pragma once
++
++__constant__ float TURBO_CENTROIDS_3BIT[8] = {
++    -0.190685f, -0.117832f, -0.065717f, -0.02146f, 0.02146f, 0.065717f, 0.117832f, 0.190685f,
++};
++
++__constant__ float TURBO_MID_3BIT[7] = {
++    -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f,
++};
++
++__constant__ float TURBO_CENTROIDS_4BIT[16] = {
++    -0.173926f, -0.117195f, -0.089527f, -0.068756f, -0.051262f, -0.035597f, -0.020989f, -0.006938f,
++    0.006938f, 0.020989f, 0.035597f, 0.051262f, 0.068756f, 0.089527f, 0.117195f, 0.173926f,
++};
++
++__constant__ float TURBO_MID_4BIT[15] = {
++    -0.145561f, -0.103361f, -0.079142f, -0.060009f, -0.04343f, -0.028293f, -0.013964f, 0.0f,
++    0.013964f, 0.028293f, 0.04343f, 0.060009f, 0.079142f, 0.103361f, 0.145561f,
++};
++
++__constant__ float TURBO_WHT_SIGNS1[128] = {
++    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
++    -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
++    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
++    1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
++    -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
++    -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
++    1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f,
++    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
++};
++
++__constant__ float TURBO_WHT_SIGNS2[128] = {
++    1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
++    1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f,
++    1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f,
++    -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
++    1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
++};
+diff --git a/src/adapter/llama-kvmem-turbo-host.h b/src/adapter/llama-kvmem-turbo-host.h
+new file mode 100644
+index 0000000..f72717b
+--- /dev/null
++++ b/src/adapter/llama-kvmem-turbo-host.h
+@@ -0,0 +1,74 @@
++// GENERATED FILE -- do not edit.
++// Source : ggml/src/ggml-cuda/turbo-quant.cuh
++// Emitter: tools/kvmem/gen-turbo-tables.py
++//
++// TurboQuant constants, copied verbatim from ggml's own CUDA codec so the KVMem
++// stage-in cannot drift away from the kernels that write the cache natively.
++//
++//   CENTROIDS_* / MID_*  Lloyd-Max codebooks and their decision boundaries
++//   WHT_SIGNS1/2         signed-FWHT sign stages. The forward transform is
++//                            x -> s2 * FWHT(x * s1) / sqrt(group)
++//                        (turbo_rotate_forward in turbo-quant.cuh). The
++//                        butterfly is orthonormal, so the inverse swaps the two
++//                        sign stages.
++//
++// Only the 128-entry WHT tables live here: the 64-element group uses their first
++// 64 entries, exactly as the CUDA and CPU codecs do.
++
++#pragma once
++
++static const float TURBO_CENTROIDS_3BIT[8] = {
++    -0.190685f, -0.117832f, -0.065717f, -0.02146f, 0.02146f, 0.065717f, 0.117832f, 0.190685f,
++};
++
++static const float TURBO_MID_3BIT[7] = {
++    -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f,
++};
++
++static const float TURBO_CENTROIDS_4BIT[16] = {
++    -0.173926f, -0.117195f, -0.089527f, -0.068756f, -0.051262f, -0.035597f, -0.020989f, -0.006938f,
++    0.006938f, 0.020989f, 0.035597f, 0.051262f, 0.068756f, 0.089527f, 0.117195f, 0.173926f,
++};
++
++static const float TURBO_MID_4BIT[15] = {
++    -0.145561f, -0.103361f, -0.079142f, -0.060009f, -0.04343f, -0.028293f, -0.013964f, 0.0f,
++    0.013964f, 0.028293f, 0.04343f, 0.060009f, 0.079142f, 0.103361f, 0.145561f,
++};
++
++static const float TURBO_WHT_SIGNS1[128] = {
++    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
++    -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
++    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
++    1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
++    -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
++    -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
++    1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f,
++    1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
++    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
++};
++
++static const float TURBO_WHT_SIGNS2[128] = {
++    1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
++    1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f,
++    1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f,
++    -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
++    1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
++    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
++    1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
++};
+diff --git a/tools/kvmem/gen-turbo-tables.py b/tools/kvmem/gen-turbo-tables.py
+new file mode 100644
+index 0000000..39b5171
+--- /dev/null
++++ b/tools/kvmem/gen-turbo-tables.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""Regenerate the TurboQuant WHT sign tables used by the KVMem adapter.
++
++The KVMem adapter needs the same signed-FWHT constants as ggml's own TurboQuant
++codec. Hard-coding them twice would drift, so they are extracted from
++ggml/src/ggml-cuda/turbo-quant.cuh and emitted as two headers:
++
++  src/adapter/llama-kvmem-turbo-host.h    static const float  (host .cpp)
++  src/adapter/llama-kvmem-turbo-device.h  __constant__ float  (stagein .cu)
++
++Two files, not one, because a single declaration cannot be both __constant__
++(device) and static const (host): the stage-in translation unit and the adapter
++.cpp files each include exactly one of them.
++
++Only the 128-element WHT tables are emitted. The 64-element variants in
++turbo-quant.cuh are their first 64 entries (both the CUDA and the CPU codec use
++the same array with a smaller group size), so a second pair would be redundant.
++
++The codebooks and their midpoint tables are emitted too: the stage-in quantiser
++has to make exactly the same nearest-centroid decision as k_set_rows_turbo3 in
++ggml/src/ggml-cuda/set-rows.cu, and a second hand-copied copy of these constants
++is the classic way for the two to drift apart.
++
++Usage:
++    python tools/kvmem/gen-turbo-tables.py [--root <fusion tree>] [--check]
++
++--check regenerates into memory and diffs against the files on disk; it exits
++non-zero if they are stale. That is the guard for "did someone edit the .cuh".
++"""
++
++from __future__ import annotations
++
++import argparse
++import pathlib
++import re
++import sys
++
++ARRAYS = (
++    "TURBO_CENTROIDS_3BIT",
++    "TURBO_MID_3BIT",
++    "TURBO_CENTROIDS_4BIT",
++    "TURBO_MID_4BIT",
++    "TURBO_WHT_SIGNS1",
++    "TURBO_WHT_SIGNS2",
++)
++
++HOST_HEADER = "src/adapter/llama-kvmem-turbo-host.h"
++DEVICE_HEADER = "src/adapter/llama-kvmem-turbo-device.h"
++
++BANNER = """// GENERATED FILE -- do not edit.
++// Source : ggml/src/ggml-cuda/turbo-quant.cuh
++// Emitter: tools/kvmem/gen-turbo-tables.py
++//
++// TurboQuant constants, copied verbatim from ggml's own CUDA codec so the KVMem
++// stage-in cannot drift away from the kernels that write the cache natively.
++//
++//   CENTROIDS_* / MID_*  Lloyd-Max codebooks and their decision boundaries
++//   WHT_SIGNS1/2         signed-FWHT sign stages. The forward transform is
++//                            x -> s2 * FWHT(x * s1) / sqrt(group)
++//                        (turbo_rotate_forward in turbo-quant.cuh). The
++//                        butterfly is orthonormal, so the inverse swaps the two
++//                        sign stages.
++//
++// Only the 128-entry WHT tables live here: the 64-element group uses their first
++// 64 entries, exactly as the CUDA and CPU codecs do.
++"""
++
++
++def parse_arrays(cuh: pathlib.Path) -> dict[str, list[float]]:
++    text = cuh.read_text(encoding="utf-8")
++    out: dict[str, list[float]] = {}
++    for name in ARRAYS:
++        m = re.search(
++            r"__constant__\s+float\s+" + name + r"\s*\[\s*(?P<n>\d+)\s*\]\s*=\s*\{(?P<body>.*?)\}\s*;",
++            text,
++            re.S,
++        )
++        if not m:
++            raise SystemExit(f"{cuh}: could not find {name}")
++        want = int(m.group("n"))
++        body = re.sub(r"//[^\n]*", "", m.group("body"))
++        # The C literals carry an `f` suffix ("-1.0f"); float() rejects it.
++        vals = [float(tok.rstrip("fF")) for tok in re.findall(r"-?\d+\.?\d*f?", body)]
++        if len(vals) != want:
++            raise SystemExit(f"{cuh}: {name} has {len(vals)} entries, expected {want}")
++        out[name] = vals
++    return out
++
++
++def fmt_val(v: float) -> str:
++    """Round-trip a float as a C literal.
++
++    Not "{:.1f}": the codebooks are dense near zero (the smallest 3-bit centroid
++    is 0.021460) and one decimal place would collapse most of the table to 0.0.
++    Nine significant digits is well past float32 precision.
++    """
++    s = f"{v:.9g}"
++    if "." not in s and "e" not in s and "E" not in s:
++        s += ".0"
++    return s + "f"
++
++
++def fmt_table(name: str, vals: list[float], storage: str) -> str:
++    lines = []
++    for i in range(0, len(vals), 8):
++        chunk = ", ".join(fmt_val(v) for v in vals[i : i + 8])
++        lines.append("    " + chunk + ",")
++    joined = "\n".join(lines)
++    return f"{storage} float {name}[{len(vals)}] = {{\n{joined}\n}};\n"
++
++
++def render_host(vals: dict[str, list[float]]) -> str:
++    body = "\n".join(fmt_table(n, vals[n], "static const") for n in ARRAYS)
++    return BANNER + "\n#pragma once\n\n" + body
++
++
++def render_device(vals: dict[str, list[float]]) -> str:
++    body = "\n".join(fmt_table(n, vals[n], "__constant__") for n in ARRAYS)
++    return BANNER + "\n#pragma once\n\n" + body
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--root", default=".", help="fusion tree root")
++    ap.add_argument("--check", action="store_true", help="fail if the files are stale")
++    args = ap.parse_args()
++
++    root = pathlib.Path(args.root).resolve()
++    cuh = root / "ggml/src/ggml-cuda/turbo-quant.cuh"
++    if not cuh.is_file():
++        raise SystemExit(f"not found: {cuh}")
++
++    vals = parse_arrays(cuh)
++    targets = {
++        root / HOST_HEADER: render_host(vals),
++        root / DEVICE_HEADER: render_device(vals),
++    }
++
++    stale = []
++    for path, text in targets.items():
++        if args.check:
++            current = path.read_text(encoding="utf-8") if path.is_file() else None
++            if current != text:
++                stale.append(path)
++        else:
++            path.write_text(text, encoding="utf-8", newline="\n")
++            print(f"wrote {path}")
++
++    if args.check:
++        if stale:
++            for p in stale:
++                print(f"STALE {p}", file=sys.stderr)
++            return 1
++        print("turbo tables up to date")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/kvmem/kvmem-spec.cpp b/tools/kvmem/kvmem-spec.cpp
+index 196e6dd..d75e364 100644
+--- a/tools/kvmem/kvmem-spec.cpp
++++ b/tools/kvmem/kvmem-spec.cpp
+@@ -46,6 +46,15 @@ ggml_type kvmem_parse_cache_type(const char * s, bool * ok) {
+     if (std::strcmp(s, "q5_0") == 0 || std::strcmp(s, "q5") == 0) {
+         return GGML_TYPE_Q5_0;
+     }
++    // TurboQuant cache types (PolarQuant + QJL, signed-FWHT rotated). Block sizes
++    // are 32 (turbo3) and 128 (turbo4); llama-kv-cache additionally requires
++    // head_dim % 64 (turbo3) or % 128 (turbo4) and refuses the cache otherwise.
++    if (std::strcmp(s, "turbo3") == 0 || std::strcmp(s, "turbo3_0") == 0) {
++        return GGML_TYPE_TURBO3_0;
++    }
++    if (std::strcmp(s, "turbo4") == 0 || std::strcmp(s, "turbo4_0") == 0) {
++        return GGML_TYPE_TURBO4_0;
++    }
+     if (ok) {
+         *ok = false;
+     }
+@@ -54,8 +63,15 @@ ggml_type kvmem_parse_cache_type(const char * s, bool * ok) {
+ 
+ bool kvmem_cache_types_ok(ggml_type type_k, ggml_type type_v) {
+     if (ggml_is_quantized(type_k) || ggml_is_quantized(type_v)) {
++        // turbo3/turbo4 are accepted here. KVMem never interprets the cache on
++        // the device: the tiered store moves opaque packed rows
++        // (RawKvStore::write_layer_k_gpu / copy_k_gpu), so the block layout only
++        // has to round-trip through ggml_row_size + ggml_type_size, which the
++        // turbo codec provides. The head_dim divisibility rule lives in
++        // llama_kv_cache, which is the only place that can see hparams.
+         const auto supported_quant = [](ggml_type type) {
+-            return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q4_0;
++            return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q4_0 ||
++                   type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+         };
+         return supported_quant(type_k) && supported_quant(type_v);
+     }
+diff --git a/tools/kvmem/llama-kvmem-cli.cpp b/tools/kvmem/llama-kvmem-cli.cpp
+index 64ad4a4..177aa37 100644
+--- a/tools/kvmem/llama-kvmem-cli.cpp
++++ b/tools/kvmem/llama-kvmem-cli.cpp
+@@ -45,9 +45,11 @@ static void print_usage(const char * argv0) {
+             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
+             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
+             "  --kvmem-dump-kv            after prefill, compare raw-rebuild KV vs GPU KV\n"
+-            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
++            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0\n"
++            "                             | turbo3 | turbo4 (default q8_0)\n"
+             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
+-            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
++            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: q8_0 | q5_0 | q4_0 | turbo3\n"
++            "                             | turbo4, K and V set independently)\n"
+             "  --spec-type TYPE           none | draft-mtp (default none)\n"
+             "  --spec-kv-dtype TYPE       MTP K/V type (default: inherit target K/V types)\n"
+             "  --spec-draft-n-max N       MTP draft tokens (default 2)\n"
+@@ -158,7 +160,7 @@ int main(int argc, char ** argv) {
+             bool ok = false;
+             const ggml_type t = kvmem_parse_cache_type(need(arg), &ok);
+             if (!ok) {
+-                fprintf(stderr, "unsupported cache type (want f16|f32|q8_0|q5_0|q4_0)\n");
++                fprintf(stderr, "unsupported cache type (want f16|f32|q8_0|q5_0|q4_0|turbo3|turbo4)\n");
+                 return 1;
+             }
+             if (eq(arg, "-ctv") || eq(arg, "--cache-type-v")) {
+diff --git a/tools/kvmem/llama-kvmem-server.cpp b/tools/kvmem/llama-kvmem-server.cpp
+index 75122ac..4168554 100644
+--- a/tools/kvmem/llama-kvmem-server.cpp
++++ b/tools/kvmem/llama-kvmem-server.cpp
+@@ -122,9 +122,11 @@ static void print_usage(const char * argv0) {
+             "  --kvmem-nvme-dir PATH      NVMe directory (default /tmp/kvmem_nvme)\n"
+             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
+             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
+-            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
++            "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0\n"
++            "                             | turbo3 | turbo4 (default q8_0)\n"
+             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
+-            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
++            "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: q8_0 | q5_0 | q4_0 | turbo3\n"
++            "                             | turbo4, K and V set independently)\n"
+             "  --spec-type TYPE           none | draft-mtp (default none)\n"
+             "  --spec-kv-dtype TYPE       MTP K/V type (default f16)\n"
+             "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
+@@ -1706,7 +1708,7 @@ int main(int argc, char ** argv) {
+             bool ok = false;
+             const ggml_type t = kvmem_parse_cache_type(need(arg), &ok);
+             if (!ok) {
+-                fprintf(stderr, "unsupported cache type (want f16|f32|q8_0|q5_0|q4_0)\n");
++                fprintf(stderr, "unsupported cache type (want f16|f32|q8_0|q5_0|q4_0|turbo3|turbo4)\n");
+                 return 1;
+             }
+             if (eq(arg, "-ctv") || eq(arg, "--cache-type-v")) {

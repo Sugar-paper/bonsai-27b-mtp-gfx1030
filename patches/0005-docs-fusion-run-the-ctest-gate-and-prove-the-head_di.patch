@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): run the ctest gate, and prove the head_dim
+ claim with perplexity
+
+Two things this ledger said were missing or unproven.
+
+ctest -R test-turbo had never run in this worktree because the HIP build dir is
+configured with LLAMA_BUILD_TESTS=OFF. Built the two targets after a reconfigure
+with tests ON (the rest of the suite, including dspark, is never touched) and it
+passes 2/2. More useful than the pass: test-turbo-wht reports max_rel=2.38e-07 and
+test-turbo-quant-cpu cosine=0.983230, identical to the llama.cpp fusion, so the
+codec and the WHT op are correct on this base too and the head_dim 128 failure is
+in the attention / KV-geometry layer.
+
+The head_dim claim rested on identical generation output. Re-measured with the
+metric that actually fails, on the promoted runtime, on SC117 (head_dim 256):
+
+  f16 6.9921   q8_0 6.9397   turbo3 7.1292   turbo4 7.0756
+
+turbo3 at head_dim 128 is 8038.79 and at head_dim 256 is 7.1292. That is the same
+metric failing on one side and normal on the other, and it yields the first usable
+quality number for these cache types: TurboQuant KV costs 1-2% perplexity.
+
+Also ruled out three hypotheses for the head_dim 128 failure, each by measurement:
+PrismML's KV mean-centering (opt-in, Q4_0-only, flag never passed), a missing
+upstream FA fix (only 3 unrelated commits in the range), and the codec itself.
+---
+ fusion/state.json           | 33 +++++++++++---
+ fusion/upstream-sync-log.md | 85 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 113 insertions(+), 5 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index dbe0d0d..f240ee8 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -61,6 +61,15 @@
+       "gen_tps":    { "f16": 174.1,  "q8_0": 160.7,  "turbo3": 156.5,  "turbo4": 151.0 },
+       "verdict": "all four cache types run; turbo costs roughly 4-10% against f16, which is the expected trade"
+     },
++    "ctest": {
++      "result": "ctest -R test-turbo -> 2/2 Passed (test-turbo-wht 0.45s, test-turbo-quant-cpu 0.46s)",
++      "how": "the HIP build dir is configured with LLAMA_BUILD_TESTS=OFF because PrismML's test-dspark-forward.cpp needs setenv, so the two turbo targets were built explicitly after a reconfigure with tests ON; the rest of the suite is never touched",
++      "values": {
++        "test-turbo-wht": "max_rel=2.38e-07",
++        "test-turbo-quant-cpu": "block=32 row_size=56 norm=6.373180 cosine=0.983230"
++      },
++      "significance": "both numbers are identical to the llama.cpp fusion's, so the WHT op and the turbo3/turbo4 codec are numerically correct on this base too, which brackets the head_dim 128 defect to the attention / KV-geometry layer rather than the codec"
++    },
+     "perplexity": {
+       "model": "qwen2.5-1.5b-instruct-q8_0 (head_dim 128)",
+       "settings": "-c 512 -fa 1 --chunks 8 -ngl 999",
+@@ -70,9 +79,17 @@
+     "production": {
+       "model": "SC117 Qwen3.6-35B-A3B (head_dim 256)",
+       "runtime": "runtimes/llama.cpp-turboquant-fusion-rocm71-gfx1030-b10335",
+-      "settings": "-c 4096 -fa 1 -ngl 999, greedy",
+-      "result": "q8_0, turbo3 and turbo4 KV all generate identical text and run at the same speed",
+-      "verdict": "turbo cache types work where they are actually used"
++      "generation": {
++        "settings": "-c 4096 -fa 1 -ngl 999, greedy",
++        "result": "q8_0, turbo3 and turbo4 KV all generate identical text and run at the same speed"
++      },
++      "perplexity": {
++        "settings": "-c 512 -fa 1 --chunks 8 -ngl 999, corpus wiki.test.raw",
++        "results": { "f16": 6.9921, "q8_0": 6.9397, "turbo3": 7.1292, "turbo4": 7.0756 },
++        "deltaVsF16": { "q8_0": "-0.75%", "turbo3": "+1.96%", "turbo4": "+1.19%" },
++        "verdict": "all four sane and clustered; TurboQuant KV costs 1-2% perplexity at head_dim 256 for the context depth it buys, which is what makes it worth using"
++      },
++      "significance": "This is the same metric that fails at head_dim 128 (PPL 8038 for turbo3), measured on the runtime production actually uses. It converts the head_dim explanation from a generation-output observation into a measured fact, and it gives a usable quality number for the cache type the launchers run."
+     },
+     "recordPaths": [
+       "temp_clean_later/bench-results/prism-fusion-probe",
+@@ -91,13 +108,19 @@
+       "notCausedBy": "The port. The original PrismML build, from which this worktree was forked, returns 329.4764 for the same q8_0 KV command with byte-identical per-chunk values. q8_0 KV has nothing to do with TurboQuant.",
+       "notUniversal": "head_dim 256 models are fine. SC117 generates identical text with q8_0, turbo3 and turbo4 KV on the promoted runtime, so this is not 'the turbo cache is broken'.",
+       "whyItMatters": "The fusion's own quality fixtures are head_dim 128, so the gate cannot be evaluated on them until this is fixed. Every production model here is head_dim 256 and unaffected.",
+-      "nextStep": "Bisect the FA vec path at D=128 against D=256: start with cpy_ne / V_rows_per_thread in fattn-vec.cuh, then the q8_0 path in the same kernel, since q8_0 fails too and has no TurboQuant code in it."
++      "ruledOut": [
++        "PrismML's own KV mean-centering feature (commits 7fb3d5b, 36d1dee). It is opt-in via --kv-mean-center, scoped to Q4_0 only, and the flag was never passed.",
++        "An upstream fix that this base predates. Between the prism merge-base (5ea87ddad) and b11046 the FA vec file only saw 3 commits (73a43d1f6, 8e93a9773, 16378d93f), none about head sizes or quantized KV.",
++        "The turbo codec and the WHT op. ctest passes with values identical to the llama.cpp fusion's."
++      ],
++      "structure": "Per the project's own port map, a 512-token prompt batch selects BEST_FATTN_KERNEL_TILE while single-token generation selects BEST_FATTN_KERNEL_VEC. Perplexity therefore exercises the tile path and my llama-cli test exercised the vec path, and both are broken at head_dim 128 - so this is not one kernel.",
++      "nextStep": "Bisect at head_dim 128 with q8_0 KV as the control, since q8_0 is fine on the llama.cpp base and broken on this one: that difference points at PrismML's own 93 commits rather than at the TurboQuant port. Then, separately, chase the turbo3 failure on the llama.cpp base, where q8_0 is fine, through the tile kernel's K/V dequantise path in convert.cu."
+     }
+   ],
+ 
+   "knownGaps": [
+     "mmvq-tq.cu (568 lines of dp4a kernels in the reference) is not ported. Performance only.",
+-    "The HIP build is configured with LLAMA_BUILD_TESTS=OFF because PrismML's test-dspark-forward.cpp needs setenv. The two turbo tests are wired into tests/CMakeLists.txt but are not compiled by this build, so the ctest gate has not actually been run here.",
++    "The HIP build dir is configured with LLAMA_BUILD_TESTS=OFF, so the turbo tests only build after an explicit reconfigure; ctest has been run that way and passes, but it is not part of the default build.",
+     "gguf-py/gguf/constants.py has no entry for the turbo types.",
+     "This worktree had no fusion/ ledger until now; these files are the first provenance record for it."
+   ],
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+index 117d267..1197fd4 100644
+--- a/fusion/upstream-sync-log.md
++++ b/fusion/upstream-sync-log.md
+@@ -139,3 +139,88 @@ the same measurement was described as a turbo3-specific defect.
+    run here. The tests are wired into `tests/CMakeLists.txt`; a separate
+    test-enabled build is needed to use them as a gate.
+ 4. `gguf-py/gguf/constants.py` has no entry for the turbo types.
++
++## 2026-09-19 (later): the ctest gate actually runs here now, and the head_dim lead narrows
++
++The ledger above recorded that `ctest -R test-turbo` had never been executed in
++this worktree, because the HIP build dir is configured with
++`LLAMA_BUILD_TESTS=OFF`. That gap is closed: after reconfiguring with tests ON the
++two turbo targets were built explicitly and the gate passes.
++
++```text
++ninja test-turbo-wht test-turbo-quant-cpu   -> OK
++ctest -R test-turbo                        -> 2/2 Passed, 1.19s
++  test-turbo-wht         max_rel=2.38e-07
++  test-turbo-quant-cpu   block=32 row_size=56 norm=6.373180 cosine=0.983230
++```
++
++**Both numbers are identical to the llama.cpp fusion's**, which is worth more than
++the pass itself: the WHT op and the turbo3/turbo4 codec are numerically correct on
++this base too. That brackets the head_dim 128 failure to the attention /
++KV-geometry layer and takes the codec off the suspect list.
++
++The rest of the suite is still never built, so `ctest` without `-R` is not
++meaningful here and PrismML's `test-dspark-forward.cpp` (needs `setenv`) remains
++the reason tests default to off.
++
++### Narrowing the head_dim 128 lead
++
++Three hypotheses eliminated, each by measurement rather than reasoning:
++
++* **PrismML's own KV mean-centering** (`7fb3d5b` per-channel K-cache
++  mean-centering, `36d1dee` hybrid models + calibration guard). This is the one
++  piece of fork-specific KV surgery in the tree, so it looked like the obvious
++  suspect for "q8_0 KV broken here but not upstream". It is opt-in via
++  `--kv-mean-center FNAME`, documented as scoped to `GGML_TYPE_Q4_0` only, and the
++  flag was never passed in any of the failing runs. Eliminated.
++* **An upstream fix this base predates.** Between the prism merge-base
++  (`5ea87ddad`) and `b11046` the FA vec file changed in only three commits
++  (`73a43d1f6` mid/mmf races, `8e93a9773` sparse-fa, `16378d93f` gfx1201 tuning),
++  none of them about head sizes or quantized KV. So a backport is not the fix.
++* **The codec / WHT op**, per the test values above.
++
++### Where it actually lives
++
++The project's own port map records that a 512-token prompt batch selects
++`BEST_FATTN_KERNEL_TILE` while single-token generation selects
++`BEST_FATTN_KERNEL_VEC`, and that the tile path converts TurboQuant K/V to f16
++through the `convert.cu` tables. So the perplexity runs exercise the **tile**
++kernel and the llama-cli check exercised the **vec** kernel — and both produce
++garbage at head_dim 128. This is not one kernel with one bug.
++
++That splits the remaining work in two, and they are different problems:
++
++1. **q8_0 KV at head_dim 128 works on the llama.cpp base and fails on this one.**
++   Since q8_0 has no TurboQuant code in it, the difference must come from
++   PrismML's own 93 commits. Bisect there, with q8_0 as a control that needs no
++   TurboQuant knowledge.
++2. **turbo3 KV at head_dim 128 fails on the llama.cpp base too**, where q8_0 is
++   fine, so that one is genuinely TurboQuant. Chase it through the tile kernel's
++   K/V dequantise path in `convert.cu`.
++
++Neither affects production: every model here that runs TurboQuant KV is
++head_dim 256.
++
++### The same metric, on the other head size
++
++The head_dim claim rested on generation output being identical on SC117. That is
++strong but indirect, so it was re-measured with the metric that fails: perplexity,
++same corpus and chunking, on the promoted b10335 runtime, on SC117
++(head_dim **256**).
++
++| KV | PPL | vs f16 |
++| --- | --- | --- |
++| f16 | 6.9921 | — |
++| q8_0 | 6.9397 | −0.75% |
++| turbo3 | 7.1292 | +1.96% |
++| turbo4 | 7.0756 | +1.19% |
++
++All four sane and tightly clustered. turbo3 at head_dim 128 is 8038.79; turbo3 at
++head_dim 256 is 7.1292. That is the head_dim explanation demonstrated with the
++failing metric itself, in the configuration production runs.
++
++It is also the first usable quality number for these cache types: **TurboQuant KV
++costs 1-2% perplexity** against f16 on this model, which is the price of the
++context depth it buys. q8_0 KV comes in marginally *below* f16, i.e. inside noise.
++
++Records: `temp_clean_later/bench-results/sc117-kv-ppl`.

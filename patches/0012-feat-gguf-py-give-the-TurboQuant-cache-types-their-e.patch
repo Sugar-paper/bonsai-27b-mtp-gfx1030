@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] feat(gguf-py): give the TurboQuant cache types their entries
+ back
+
+ggml.h has had GGML_TYPE_TURBO3_0 = 43 and GGML_TYPE_TURBO4_0 = 44 all along, but
+GGMLQuantizationType stopped at 42 (Q2_0) and jumped to 142 (PQ2_0), so anything
+going through gguf-py could not name, size or round-trip a GGUF that carries them.
+
+Sizes come from ggml-common.h: block_turbo3_0 is 32 values in 14 bytes
+(ggml_half + 32/4 index + 32/8 sign) and block_turbo4_0 is 128 values in 68 bytes
+(2 ggml_half + 128/2 nibbles), both confirmed by the static_asserts at the
+definitions.
+---
+ gguf-py/gguf/constants.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 648a996..f5c91d9 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -5451,6 +5451,8 @@ class GGMLQuantizationType(IntEnum):
+     NVFP4   = 40
+     Q1_0    = 41
+     Q2_0    = 42
++    TURBO3_0 = 43
++    TURBO4_0 = 44
+     PQ2_0   = 142
+     PTQ1_0  = 143
+ 
+@@ -5647,6 +5649,10 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
+     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
+     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
++    # ggml_half + 32/4 index bytes + 32/8 sign bytes              = 14
++    GGMLQuantizationType.TURBO3_0: (32, 14),
++    # 2 ggml_half (norm + reserved) + 128/2 nibble bytes          = 68
++    GGMLQuantizationType.TURBO4_0: (128, 68),
+     GGMLQuantizationType.PQ2_0:   (128, 2 + 32),
+     GGMLQuantizationType.PTQ1_0:  (128, 2 + 24 + 2),
+ }

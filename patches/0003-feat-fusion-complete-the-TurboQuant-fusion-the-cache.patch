@@ -1,0 +1,1658 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] feat(fusion): complete the TurboQuant fusion, the cache types
+ were unusable
+
+c6fbb78 ported the TurboQuant types and kernels but not the integration, so
+`--cache-type-k turbo3` was rejected by the CLI and none of it could be reached:
+
+    error while handling argument "-ctk": Unsupported cache type: turbo3
+    allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+
+This adds the missing layer. Taken from the verified fusion/turboquant-on-b10964
+branch rather than from the TurboQuant fork, which has moved on since.
+
+* common/arg.cpp: register turbo3/turbo4 in kv_cache_types. Two lines, and the
+  ones that actually unblock everything.
+* ggml/src/ggml-cuda/fattn.cu: dispatch the 8 turbo K/V pairs in both branches of
+  the FA_ALL_QUANTS switch, and accept the types in ggml_cuda_fattn_kv_type_supported.
+  The instances are compiled unconditionally (explicit list in the CMakeLists), so
+  the non-FA_ALL_QUANTS branch needs them too.
+* ggml/src/ggml-cuda/convert.cu: 2 cases in each of the 6 to_fp16/fp32/bf16 tables.
+* ggml/src/ggml-cuda/set-rows.cu: the turbo KV write kernel.
+* src/llama-graph.cpp: the rotations. WHT on q before every build_attn_mha call
+  (all 7 overloads, not just the 5 the older branch has), the inverse WHT on the
+  FA output and on kqv in the non-FA path.
+* ggml/src/ggml-cpu/{ggml-cpu.c,ops.cpp,ops.h}: CPU traits, vec_dot, and the
+  SET_ROWS WHT group-size handoff.
+* ggml/src/ggml.c: the two ggml_quantize_chunk cases. The switch is
+  `default: assert(false)`, so without them runtime quantization aborts.
+* ggml/include/ggml.h: declare ggml_turbo_wht. It was defined in ggml.c but never
+  declared, so llama-graph could not have called it.
+* ggml/{src,src/ggml-cuda,src/ggml-hip}/CMakeLists.txt: also removed a duplicated
+  FA-instance block. The port had appended its own copy, leaving two
+  `if (GGML_CUDA_FA_ALL_QUANTS)` blocks back to back; the second one omitted the
+  turbo instances.
+* tools/llama-bench/llama-bench.cpp: turbo3/turbo4 name mapping, without which the
+  performance gate cannot run.
+* tests/: test-turbo-wht.cpp and test-turbo-quant-cpu.cpp plus the CMake wiring for
+  `ctest -R test-turbo`. Note the HIP build is configured with
+  LLAMA_BUILD_TESTS=OFF.
+
+Verification (RX 6900 XT, gfx1030, ROCm 7.1):
+  BUILD_OK
+  llama-server --help    -> turbo3, turbo4 accepted as cache types
+  llama-bench -p 256 -n 32 -r 2 on qwen2.5-1.5B q8_0:
+      f16 7801.5/174.1   q8_0 7635.8/160.7   turbo3 7449.1/156.5   turbo4 7467.7/151.0
+  perplexity, -c 512 --chunks 8 -ngl 999 -fa 1, qwen2.5-1.5B:
+      f16    10.6801   correct
+      q8_0   329.4764  broken
+      turbo3 8038.7921  broken
+
+Those last two are NOT caused by this port. The same q8_0 KV command on the
+original PrismML build, from which this worktree was forked, returns 329.4764 with
+byte-identical per-chunk values, so quantized KV is already broken on this base.
+And production models are unaffected: SC117 (head_dim 256) generates identical text
+with q8_0, turbo3 and turbo4 KV on the promoted b10335 runtime. The 1.5B fixture is
+the only model here with head_dim 128, which is where quantized KV diverges.
+---
+ common/arg.cpp                    |   2 +
+ ggml/include/ggml.h               |  11 +
+ ggml/src/ggml-cpu/ggml-cpu.c      |  66 ++++
+ ggml/src/ggml-cpu/ops.cpp         |  89 +++++
+ ggml/src/ggml-cpu/ops.h           |   1 +
+ ggml/src/ggml-cuda/CMakeLists.txt |  12 -
+ ggml/src/ggml-cuda/convert.cu     |  25 ++
+ ggml/src/ggml-cuda/fattn.cu       |  34 ++
+ ggml/src/ggml-cuda/set-rows.cu    | 543 ++++++++++++++++++++++++++++++
+ ggml/src/ggml-hip/CMakeLists.txt  |  12 -
+ ggml/src/ggml.c                   |   2 +
+ src/llama-context.cpp             |  13 +-
+ src/llama-graph.cpp               |  83 +++++
+ src/llama-kv-cache.cpp            |  37 +-
+ tests/CMakeLists.txt              |   6 +
+ tests/test-turbo-quant-cpu.cpp    | 143 ++++++++
+ tests/test-turbo-wht.cpp          |  85 +++++
+ tools/llama-bench/llama-bench.cpp |  10 +
+ 18 files changed, 1146 insertions(+), 28 deletions(-)
+ create mode 100644 tests/test-turbo-quant-cpu.cpp
+ create mode 100644 tests/test-turbo-wht.cpp
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 63f3a7b..11cb88d 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -311,6 +311,8 @@ const std::vector<ggml_type> kv_cache_types = {
+     GGML_TYPE_IQ4_NL,
+     GGML_TYPE_Q5_0,
+     GGML_TYPE_Q5_1,
++    GGML_TYPE_TURBO3_0,
++    GGML_TYPE_TURBO4_0,
+ };
+ 
+ static ggml_type kv_cache_type_from_str(const std::string & s) {
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 1dd6b43..b7ebea8 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2607,6 +2607,17 @@ extern "C" {
+             struct ggml_tensor  * state,
+             int64_t               K);
+ 
++    // TurboQuant Walsh-Hadamard Transform: the O(d log d) rotation the TurboQuant
++    // cache types need around attention. llama-graph calls it on q, on the V-side
++    // activations and on kqv; the kernel itself lives in ggml-cuda/turbo-wht.cu.
++    // direction: 0 = forward, 1 = inverse.
++    // group_size: 0 = auto (128 when ne[0] % 128 == 0, otherwise 64).
++    GGML_API struct ggml_tensor * ggml_turbo_wht(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   direction,
++            int                   group_size);
++
+     // rows-indexed state read: instead of a gathered [S_v, S_v, H_v, n_seqs]
+     // scratch, the op reads each sequence's live state directly from `states`
+     // (2D cache view, D = S_v*S_v*H_v wide rows) at row `rows[seq]` (I32,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 9cd2c2d..d1de06d 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -8,6 +8,7 @@
+ #include "ggml-cpu.h"
+ #include "ggml-impl.h"
+ #include "quants.h"
++#include "ggml-quants.h"
+ #include "ggml-threading.h"
+ #include "unary-ops.h"
+ #include "binary-ops.h"
+@@ -212,6 +213,13 @@ typedef pthread_t ggml_thread_t;
+ #include <TargetConditionals.h>
+ #endif
+ 
++static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
++                                       const void * GGML_RESTRICT vx, size_t bx,
++                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
++static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
++                                       const void * GGML_RESTRICT vx, size_t bx,
++                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
++
+ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+     [GGML_TYPE_F32] = {
+         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
+@@ -422,6 +430,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+         .nrows                    = 1,
+     },
++    [GGML_TYPE_TURBO3_0] = {
++        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
++        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo3_0_f32,
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_TURBO4_0] = {
++        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
++        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo4_0_f32,
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
+     [GGML_TYPE_I32] = {
+         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+     },
+@@ -2081,6 +2101,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_gated_delta_net(params, tensor);
+             } break;
++        case GGML_OP_TURBO_WHT:
++            {
++                ggml_compute_forward_turbo_wht(params, tensor);
++            } break;
+         case GGML_OP_LIGHTNING_INDEXER:
+             {
+                 ggml_compute_forward_lightning_indexer(params, tensor);
+@@ -2277,6 +2301,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_COUNT_EQUAL:
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_GATED_DELTA_NET:
++        case GGML_OP_TURBO_WHT:
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+@@ -3014,6 +3039,10 @@ struct ggml_cplan ggml_graph_plan(
+                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+                         cur = per_thread * sizeof(float) * n_tasks;
+                     } break;
++                case GGML_OP_TURBO_WHT:
++                    {
++                        cur = 0; // no extra workspace needed
++                    } break;
+                 case GGML_OP_COUNT:
+                     {
+                         GGML_ABORT("fatal error");
+@@ -3458,6 +3487,43 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
+     return ggml_graph_compute(cgraph, &cplan);
+ }
+ 
++// TurboQuant3 vec_dot: dequantize turbo3 block to f32, then dot with f32 operand.
++static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
++                                       const void * GGML_RESTRICT vx, size_t bx,
++                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    GGML_ASSERT(nrc == 1);
++    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
++
++    float tmp[4096];
++    GGML_ASSERT(n <= 4096);
++    ggml_get_type_traits(GGML_TYPE_TURBO3_0)->to_float(vx, tmp, n);
++
++    const float * y = (const float *) vy;
++    float sum = 0.0f;
++    for (int i = 0; i < n; i++) {
++        sum += tmp[i] * y[i];
++    }
++    *s = sum;
++}
++
++static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
++                                       const void * GGML_RESTRICT vx, size_t bx,
++                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    GGML_ASSERT(nrc == 1);
++    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
++
++    float tmp[4096];
++    GGML_ASSERT(n <= 4096);
++    ggml_get_type_traits(GGML_TYPE_TURBO4_0)->to_float(vx, tmp, n);
++
++    const float * y = (const float *) vy;
++    float sum = 0.0f;
++    for (int i = 0; i < n; i++) {
++        sum += tmp[i] * y[i];
++    }
++    *s = sum;
++}
++
+ void ggml_cpu_fp32_to_fp32(const float * x, float * y, int64_t n) {
+     memcpy(y, x, n * sizeof(float));
+ }
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 4fc7514..162b164 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ggml-cpu.h"
+ #include "ggml-impl.h"
++#include "ggml-quants.h"
+ #include "binary-ops.h"
+ #include "simd-gemm.h"
+ #include "ggml.h"
+@@ -5130,6 +5131,13 @@ static void ggml_compute_forward_set_rows_impl(
+ 
+     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+ 
++    // For turbo3/turbo4: communicate WHT group size to the quantize function via global
++    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0) {
++        int gs = 0;
++        memcpy(&gs, dst->op_params, sizeof(int));
++        ggml_turbo3_set_wht_group_size((gs == 64 || gs == 128) ? gs : 0);
++    }
++
+     for (int64_t i03 = 0; i03 < ne03; ++i03) {
+         for (int64_t i02 = 0; i02 < ne02; ++i02) {
+             for (int64_t i = ir0; i < ir1; ++i) {
+@@ -5815,6 +5823,8 @@ void ggml_compute_forward_clamp(
+         case GGML_TYPE_IQ3_S:
+         case GGML_TYPE_IQ2_S:
+         case GGML_TYPE_Q8_K:
++        case GGML_TYPE_TURBO3_0:
++        case GGML_TYPE_TURBO4_0:
+         case GGML_TYPE_I8:
+         case GGML_TYPE_I16:
+         case GGML_TYPE_I32:
+@@ -10995,6 +11005,85 @@ void ggml_compute_forward_gated_delta_net(
+     }
+ }
+ 
++// ggml_compute_forward_turbo_wht
++
++// WHT sign arrays (must match Metal shader turbo_wht_signs1/2)
++static const float turbo_wht_s1[128] = {-1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,-1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,-1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1};
++static const float turbo_wht_s2[128] = {1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1};
++
++static void ggml_compute_forward_turbo_wht_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * src = dst->src[0];
++    const float * src_data = (const float *) src->data;
++    float * dst_data = (float *) dst->data;
++
++    int direction;
++    int group_size;
++    memcpy(&direction, dst->op_params + 0, sizeof(int));
++    memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
++
++    const int64_t head_dim        = src->ne[0];
++    const int64_t n_heads         = ggml_nelements(src) / head_dim;
++    const int64_t groups_per_head = head_dim / group_size;
++    const int     tail_size       = (int)(head_dim % group_size);
++    const int64_t n_groups        = groups_per_head * n_heads;
++
++    const float inv_sqrt = 1.0f / sqrtf((float)group_size);
++
++    const int64_t ith = params->ith;
++    const int64_t nth = params->nth;
++    const int64_t grp_start = (n_groups * ith) / nth;
++    const int64_t grp_end   = (n_groups * (ith + 1)) / nth;
++
++    const float * s_first  = (direction == 0) ? turbo_wht_s1 : turbo_wht_s2;
++    const float * s_second = (direction == 0) ? turbo_wht_s2 : turbo_wht_s1;
++
++    for (int64_t g = grp_start; g < grp_end; g++) {
++        const int64_t head_idx    = g / groups_per_head;
++        const int64_t grp_in_head = g % groups_per_head;
++        const int64_t base        = head_idx * head_dim + grp_in_head * group_size;
++
++        float x[128];
++        const float * in = src_data + base;
++
++        for (int i = 0; i < group_size; i++) x[i] = in[i] * s_first[i];
++
++        for (int h = 1; h < group_size; h *= 2) {
++            for (int i = 0; i < group_size; i += h * 2) {
++                for (int j = i; j < i + h; j++) {
++                    const float a = x[j];
++                    const float b = x[j + h];
++                    x[j]     = a + b;
++                    x[j + h] = a - b;
++                }
++            }
++        }
++
++        float * out = dst_data + base;
++        for (int i = 0; i < group_size; i++) {
++            out[i] = x[i] * inv_sqrt * s_second[i];
++        }
++    }
++
++    if (tail_size > 0 && ith == 0) {
++        const int64_t tail_offset = groups_per_head * group_size;
++        for (int64_t h = 0; h < n_heads; h++) {
++            const int64_t base = h * head_dim + tail_offset;
++            memcpy(dst_data + base, src_data + base, tail_size * sizeof(float));
++        }
++    }
++}
++
++void ggml_compute_forward_turbo_wht(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
++        default: GGML_ABORT("fatal error");
++    }
++}
++
+ 
+ // ggml_compute_forward_dsv4_hc_comb
+ 
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 4c1642a..4f4a523 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -105,6 +105,7 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
+ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_turbo_wht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 2ddf637..7e6fb30 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -133,18 +133,6 @@ if (CUDAToolkit_FOUND)
+     endif()
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+ 
+-    if (GGML_CUDA_FA_ALL_QUANTS)
+-        file(GLOB   SRCS "template-instances/fattn-vec*.cu")
+-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+-        add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+-    else()
+-        list(APPEND GGML_SOURCES_CUDA
+-            template-instances/fattn-vec-instance-f16-f16.cu
+-            template-instances/fattn-vec-instance-q4_0-q4_0.cu
+-            template-instances/fattn-vec-instance-q8_0-q8_0.cu
+-            template-instances/fattn-vec-instance-bf16-bf16.cu)
+-    endif()
+-
+     ggml_add_backend_library(ggml-cuda
+                              ${GGML_HEADERS_CUDA}
+                              ${GGML_SOURCES_CUDA}
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 8644720..8b6730c 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -2,6 +2,7 @@
+ #include "turbo-quant.cuh"
+ 
+ #include "dequantize.cuh"
++#include "turbo-quant.cuh"
+ 
+ #include <cstdint>
+ 
+@@ -594,6 +595,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
+             return dequantize_row_mxfp4_cuda;
+         case GGML_TYPE_NVFP4:
+             return dequantize_row_nvfp4_cuda;
++        case GGML_TYPE_TURBO3_0:
++            return dequantize_block_cont_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
++        case GGML_TYPE_TURBO4_0:
++            return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+         case GGML_TYPE_F32:
+             return convert_unary_cont_cuda<float>;
+         case GGML_TYPE_F16:
+@@ -662,6 +667,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+             return dequantize_row_mxfp4_cuda;
+         case GGML_TYPE_NVFP4:
+             return dequantize_row_nvfp4_cuda;
++        case GGML_TYPE_TURBO3_0:
++            return dequantize_block_cont_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
++        case GGML_TYPE_TURBO4_0:
++            return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+         case GGML_TYPE_F32:
+             return convert_unary_cont_cuda<float>;
+         case GGML_TYPE_BF16:
+@@ -727,6 +736,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return dequantize_row_mxfp4_cuda;
+         case GGML_TYPE_NVFP4:
+             return dequantize_row_nvfp4_cuda;
++        case GGML_TYPE_TURBO3_0:
++            return dequantize_block_cont_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
++        case GGML_TYPE_TURBO4_0:
++            return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+         case GGML_TYPE_F16:
+             return convert_unary_cont_cuda<half>;
+         case GGML_TYPE_BF16:
+@@ -758,6 +771,10 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_TURBO3_0:
++            return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
++        case GGML_TYPE_TURBO4_0:
++            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+         case GGML_TYPE_BF16:
+             return convert_unary_cuda<nv_bfloat16>;
+         default:
+@@ -787,6 +804,10 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_TURBO3_0:
++            return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
++        case GGML_TYPE_TURBO4_0:
++            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+         case GGML_TYPE_F16:
+             return convert_unary_cuda<half, nv_bfloat16>;
+         default:
+@@ -816,6 +837,10 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_TURBO3_0:
++            return dequantize_block_cuda<QK_TURBO3, QR_TURBO3, dequantize_turbo3_0>;
++        case GGML_TYPE_TURBO4_0:
++            return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
+         case GGML_TYPE_BF16:
+             return convert_unary_cuda<nv_bfloat16, float>;
+         default:
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ab7a3b2..3e1c0d3 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -317,11 +317,36 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
++
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
++
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
++
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+ #else
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
++
++    // The TurboQuant FA instances are compiled unconditionally (see the explicit
++    // list in ggml-cuda/CMakeLists.txt and ggml-hip/CMakeLists.txt), so they have
++    // to be dispatched here as well, not only in the FA_ALL_QUANTS branch.
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
++
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
++
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+ #endif // GGML_CUDA_FA_ALL_QUANTS
+ 
+     GGML_ABORT("fatal error");
+@@ -349,6 +374,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+         case GGML_TYPE_Q4_0:
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_BF16:
++        case GGML_TYPE_TURBO3_0:
++        case GGML_TYPE_TURBO4_0:
+             return true;
+         default:
+             return false;
+@@ -449,6 +476,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
++    // TurboQuant KV stores 64-element groups, so the head size must be a multiple
++    // of 64 for the rotation to line up.
++    if ((K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
++         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0) && K->ne[0] % 64 != 0) {
++        return BEST_FATTN_KERNEL_NONE;
++    }
++
+     if (mask && mask->ne[2] != 1) {
+         return BEST_FATTN_KERNEL_NONE;
+     }
+diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+index 4659970..5cce3b6 100644
+--- a/ggml/src/ggml-cuda/set-rows.cu
++++ b/ggml/src/ggml-cuda/set-rows.cu
+@@ -1,5 +1,6 @@
+ #include "set-rows.cuh"
+ #include "cpy-utils.cuh"
++#include "turbo-quant.cuh"
+ 
+ typedef void (*set_rows_kernel_t)(const char * src, char * dst);
+ 
+@@ -110,6 +111,544 @@ static void set_rows_cuda_quant(
+     }
+ }
+ 
++// ---- TurboQuant3 set_rows: GROUP_SIZE-element groups with WHT rotation + norm correction ----
++//
++// Templated on GROUP_SIZE (128 or 64).
++// Parallel kernel: one CUDA block per group, GROUP_SIZE threads per block.
++// Thread j handles element j within the group.
++//
++// Steps (all parallel):
++//   1. Load element j from global memory
++//   2. Parallel L2 norm (warp reduce + inter-warp via shared memory)
++//   3. Normalize
++//   4. Forward WHT (log2(GROUP_SIZE) butterfly stages, shared memory)
++//   5. Quantize element j to 3-bit centroid index
++//   6. Pack qs (warp shuffle) and signs (__ballot_sync) into turbo3 block, no atomics
++//   7. Parallel reconstruction norm (same pattern as step 2)
++//   8. Write corrected norm (one thread per sub-block)
++
++template <typename idx_t, int GROUP_SIZE>
++__launch_bounds__(128)  // max of 128 or 64
++static __global__ void k_set_rows_turbo3(
++        const float * __restrict__ src0,
++        const idx_t * __restrict__ src1,
++        block_turbo3_0 * __restrict__ dst,
++        const int64_t ne00,
++        const int64_t ne01,
++        const int64_t ne10,
++        const int64_t ne11,
++        const int64_t ne12,
++        const int64_t ne13,
++        const int64_t s01,
++        const int64_t s02,
++        const int64_t s03,
++        const int64_t s10,
++        const int64_t s11,
++        const int64_t s12,
++        const int64_t s1,
++        const int64_t s2,
++        const int64_t s3) {
++
++    static_assert(GROUP_SIZE == 128 || GROUP_SIZE == 64, "GROUP_SIZE must be 128 or 64");
++
++    // blockIdx.x = flat group index; threadIdx.x = element within group (0..GROUP_SIZE-1)
++    const int j = threadIdx.x;
++
++    // Decode blockIdx.x → (i_grp, i01, i02, i03)
++    constexpr int blocks_per_group = GROUP_SIZE / QK_TURBO3;
++    const int64_t n_groups_per_row = ne00 / GROUP_SIZE;
++    const int64_t g = blockIdx.x;
++    const int64_t i_grp = g % n_groups_per_row;
++    int64_t       tmp   = g / n_groups_per_row;
++    const int64_t i01   = tmp % ne01;
++    tmp                 = tmp / ne01;
++    const int64_t i02   = tmp % ne12;
++    const int64_t i03   = tmp / ne12;
++
++    const int64_t i12 = i02;
++    const int64_t i11 = i01 % ne11;
++    const int64_t i10 = i01;
++
++    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
++    const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
++    block_turbo3_0 * dst_row_ptr = (block_turbo3_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
++    block_turbo3_0 * blk_base    = dst_row_ptr + i_grp * blocks_per_group;
++
++    // ---- Step 1: Load element j (coalesced) ----
++    __shared__ float x[GROUP_SIZE];
++    x[j] = src_row[i_grp * GROUP_SIZE + j];
++    __syncthreads();
++
++    // ---- Step 2: Parallel L2 norm ----
++    constexpr int n_warps = GROUP_SIZE / WARP_SIZE;
++    __shared__ float warp_accum[n_warps];
++    float v = x[j];
++    float v2 = v * v;
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
++        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
++    if (j % WARP_SIZE == 0)
++        warp_accum[j / WARP_SIZE] = v2;
++    __syncthreads();
++
++    __shared__ float s_norm_sq;
++    if (j == 0) {
++        float total = 0.0f;
++        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
++        s_norm_sq = total;
++    }
++    __syncthreads();
++    const float grp_norm  = sqrtf(s_norm_sq);
++    const float inv_norm  = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
++
++    // ---- Step 3: Normalize ----
++    x[j] *= inv_norm;
++    __syncthreads();
++
++    // ---- Step 4: Forward WHT (signs1 → butterfly → signs2, normalized) ----
++    if (GROUP_SIZE == 128) {
++        x[j] *= TURBO_WHT_SIGNS1[j];
++    } else {
++        x[j] *= TURBO_WHT_SIGNS1_64[j];
++    }
++    __syncthreads();
++
++#define WHT_STAGE_SHARED(h) \
++    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
++    __syncthreads();
++
++    // Butterfly stages: loop from h=1 to h<GROUP_SIZE, doubling each time
++    WHT_STAGE_SHARED(1)
++    WHT_STAGE_SHARED(2)
++    WHT_STAGE_SHARED(4)
++    WHT_STAGE_SHARED(8)
++    WHT_STAGE_SHARED(16)
++    WHT_STAGE_SHARED(32)
++    if (GROUP_SIZE == 128) { WHT_STAGE_SHARED(64) }
++#undef WHT_STAGE_SHARED
++
++    constexpr float inv_sqrt_group = (GROUP_SIZE == 128) ? 0.08838834764831845f : 0.125f;
++    if (GROUP_SIZE == 128) {
++        x[j] = x[j] * inv_sqrt_group * TURBO_WHT_SIGNS2[j];
++    } else {
++        x[j] = x[j] * inv_sqrt_group * TURBO_WHT_SIGNS2_64[j];
++    }
++    __syncthreads();
++
++    // ---- Step 5: Quantize element j ----
++    const float rv = x[j];
++    const uint8_t idx = turbo_nearest_centroid_3bit(rv);
++
++    // ---- Step 6: Pack qs and signs (warp-cooperative, no atomics) ----
++    // The packing below is warp-cooperative: the qs shuffle and the signs ballot
++    // are WARP_SIZE wide, so one hardware warp must cover exactly one QK_TURBO3
++    // storage block. A wider block would spread one block over several warps and
++    // silently drop the upper lanes; a narrower block would leave trailing bytes
++    // of the block unwritten. Both corrupt the cache and still compile, so the
++    // contract is asserted here instead of being assumed.
++    static_assert(QK_TURBO3 == WARP_SIZE, "turbo3 set-rows packing requires QK_TURBO3 == WARP_SIZE");
++    const int lane          = j % WARP_SIZE;
++    const int elem_in_block = j % QK_TURBO3;
++    block_turbo3_0 * blk    = blk_base + (j / QK_TURBO3);
++
++    // Pack qs: 4 elements per byte, 2 bits each.
++    // All 4 threads in a qs-group gather their low2 bits via shuffle.
++    const int qs_byte_idx = elem_in_block / 4;
++    const uint8_t my_low2 = idx & 0x3;
++    uint8_t qs_byte = 0;
++#pragma unroll
++    for (int k = 0; k < 4; k++) {
++        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
++        qs_byte |= contrib << (k * 2);
++    }
++    if (lane % 4 == 0) blk->qs[qs_byte_idx] = qs_byte;
++
++    // Pack signs: 8 elements per byte, 1 bit each.  __ballot_sync across warp.
++    // The native ballot return type is used so that a future WARP_SIZE change
++    // cannot silently truncate the upper lanes.
++    const unsigned long long ballot = __ballot_sync(0xffffffffffffffffULL, (idx >> 2) & 1);
++    const int signs_byte_idx = elem_in_block / 8;
++    const uint8_t signs_byte = (uint8_t)((ballot >> (signs_byte_idx * 8)) & 0xFF);
++    if (lane % 8 == 0) blk->signs[signs_byte_idx] = signs_byte;
++
++    // ---- Step 7: Reconstruction norm (parallel, same pattern as step 2) ----
++    const float c = TURBO_CENTROIDS_3BIT[idx];
++    float rc = c * c;
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
++        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
++    if (j % WARP_SIZE == 0)
++        warp_accum[j / WARP_SIZE] = rc;
++    __syncthreads();
++
++    __shared__ float s_recon_sq;
++    if (j == 0) {
++        float total = 0.0f;
++        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
++        s_recon_sq = total;
++    }
++    __syncthreads();
++    const float recon_norm     = sqrtf(s_recon_sq);
++    const float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
++
++    // ---- Step 8: Write corrected norm (one thread per turbo3 sub-block) ----
++    if (lane == 0) blk->norm = __float2half(corrected_norm);
++
++    GGML_UNUSED(ne10);
++    GGML_UNUSED(ne13);
++}
++
++// ---- TurboQuant3 tail kernel: straight 3-bit quantize without WHT rotation ----
++//
++// For head dims not divisible by 128 (e.g. 576 = 4*128 + 64), the remainder
++// elements can't use the 128-element WHT. They are quantised directly into
++// standard turbo3 blocks.  Q is also NOT rotated for these positions (the graph
++// guards on ne[0] % 128), so <Q_tail, K_tail> stays in the original space.
++//
++// One CUDA block per row, with tail_size threads (must be multiple of 32).
++
++template <typename idx_t>
++static __global__ void k_set_rows_turbo3_tail(
++        const float * __restrict__ src0,
++        const idx_t * __restrict__ src1,
++        block_turbo3_0 * __restrict__ dst,
++        const int64_t ne00,
++        const int64_t ne01,
++        const int64_t ne10,
++        const int64_t ne11,
++        const int64_t ne12,
++        const int64_t ne13,
++        const int64_t s01,
++        const int64_t s02,
++        const int64_t s03,
++        const int64_t s10,
++        const int64_t s11,
++        const int64_t s12,
++        const int64_t s1,
++        const int64_t s2,
++        const int64_t s3,
++        const int tail_size) {
++
++    const int j = threadIdx.x;  // 0 .. tail_size-1
++
++    // Decode blockIdx.x → (i01, i02, i03)
++    int64_t tmp = blockIdx.x;
++    const int64_t i01 = tmp % ne01; tmp /= ne01;
++    const int64_t i02 = tmp % ne12;
++    const int64_t i03 = tmp / ne12;
++
++    const int64_t i11 = i01 % ne11;
++    const int64_t i10 = i01;
++    const int64_t i12 = i02;
++
++    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
++    const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
++    block_turbo3_0 * dst_row_ptr = (block_turbo3_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
++
++    // Tail starts after all full 128-element groups
++    const int64_t n_full = ne00 / QK_TURBO3_GROUP;
++    const int64_t tail_start = n_full * QK_TURBO3_GROUP;
++    block_turbo3_0 * blk_base = dst_row_ptr + n_full * (QK_TURBO3_GROUP / QK_TURBO3);
++
++    // ---- Load ----
++    const float val = src_row[tail_start + j];
++
++    // ---- L2 norm over the tail group (warp reduce + inter-warp) ----
++    const int n_warps = tail_size / WARP_SIZE;
++    const int warp_id = j / WARP_SIZE;
++    const int lane    = j % WARP_SIZE;
++
++    __shared__ float warp_accum[4];  // max 3 warps (tail ≤ 96)
++    float v2 = val * val;
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
++        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
++    if (lane == 0) warp_accum[warp_id] = v2;
++    __syncthreads();
++
++    __shared__ float s_norm_sq;
++    if (j == 0) {
++        float total = 0.0f;
++        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
++        s_norm_sq = total;
++    }
++    __syncthreads();
++    const float grp_norm = sqrtf(s_norm_sq);
++    const float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
++
++    // ---- Normalize (no WHT!) ----
++    const float rv = val * inv_norm;
++
++    // ---- Quantize ----
++    const uint8_t idx = turbo_nearest_centroid_3bit(rv);
++
++    // ---- Pack qs and signs (same warp-cooperative logic) ----
++    // Same block/warp contract as the main kernel: one warp per QK_TURBO3 block.
++    static_assert(QK_TURBO3 == WARP_SIZE, "turbo3 tail set-rows packing requires QK_TURBO3 == WARP_SIZE");
++    const int elem_in_block = j % QK_TURBO3;
++    block_turbo3_0 * blk = blk_base + (j / QK_TURBO3);
++
++    const uint8_t my_low2 = idx & 0x3;
++    uint8_t qs_byte = 0;
++#pragma unroll
++    for (int k = 0; k < 4; k++) {
++        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
++        qs_byte |= contrib << (k * 2);
++    }
++    if (lane % 4 == 0) blk->qs[elem_in_block / 4] = qs_byte;
++
++    const unsigned long long ballot = __ballot_sync(0xffffffffffffffffULL, (idx >> 2) & 1);
++    const int signs_byte_idx = elem_in_block / 8;
++    const uint8_t signs_byte = (uint8_t)((ballot >> (signs_byte_idx * 8)) & 0xFF);
++    if (lane % 8 == 0) blk->signs[signs_byte_idx] = signs_byte;
++
++    // ---- Reconstruction norm ----
++    const float c = TURBO_CENTROIDS_3BIT[idx];
++    float rc = c * c;
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
++        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
++    if (lane == 0) warp_accum[warp_id] = rc;
++    __syncthreads();
++
++    __shared__ float s_recon_sq;
++    if (j == 0) {
++        float total = 0.0f;
++        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
++        s_recon_sq = total;
++    }
++    __syncthreads();
++    const float recon_norm     = sqrtf(s_recon_sq);
++    const float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
++
++    if (lane == 0) blk->norm = __float2half(corrected_norm);
++
++    GGML_UNUSED(ne10);
++    GGML_UNUSED(ne13);
++}
++
++template<typename idx_t>
++static void set_rows_cuda_turbo3(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        ggml_tensor * dst) {
++
++    const float * src0_d = (const float *)src0->data;
++    const idx_t * src1_d = (const idx_t *)src1->data;
++
++    GGML_TENSOR_BINARY_OP_LOCALS
++    GGML_ASSERT(ne00 % QK_TURBO3 == 0);  // must be block-aligned (32)
++
++    cudaStream_t stream = ctx.stream();
++
++    // Read WHT group size from op_params (set by llama-kv-cache.cpp based on head_dim).
++    // Default to 128 if not set (backward compat with head_dim=128 models).
++    int group_size = 128;
++    memcpy(&group_size, dst->op_params, sizeof(int));
++    if (group_size != 64 && group_size != 128) group_size = 128;
++    GGML_ASSERT(ne00 % group_size == 0);
++
++    const int64_t n_full_groups   = ne00 / group_size;
++    const int     tail_size       = (int)(ne00 % group_size);
++
++    const int64_t s01 = nb01/sizeof(float);
++    const int64_t s02 = nb02/sizeof(float);
++    const int64_t s03 = nb03/sizeof(float);
++    const int64_t s10 = nb10/sizeof(idx_t);
++    const int64_t s11 = nb11/sizeof(idx_t);
++    const int64_t s12 = nb12/sizeof(idx_t);
++
++    // Launch 1: full groups with WHT rotation
++    if (n_full_groups > 0) {
++        const int64_t ne_total = n_full_groups * ne01 * ne02 * ne03;
++        if (group_size == 128) {
++            k_set_rows_turbo3<idx_t, 128><<<(int)ne_total, 128, 0, stream>>>(
++                src0_d, src1_d, (block_turbo3_0 *)dst->data,
++                ne00, ne01, ne10, ne11, ne12, ne13,
++                s01, s02, s03, s10, s11, s12,
++                nb1, nb2, nb3);
++        } else {
++            k_set_rows_turbo3<idx_t, 64><<<(int)ne_total, 64, 0, stream>>>(
++                src0_d, src1_d, (block_turbo3_0 *)dst->data,
++                ne00, ne01, ne10, ne11, ne12, ne13,
++                s01, s02, s03, s10, s11, s12,
++                nb1, nb2, nb3);
++        }
++    }
++
++    // Launch 2: tail elements (no WHT, straight quantize)
++    // Not needed for 64-aligned dims but kept for potential future use
++    if (tail_size > 0) {
++        GGML_ASSERT(tail_size % QK_TURBO3 == 0);  // tail must be block-aligned
++        const int64_t n_rows = ne01 * ne02 * ne03;
++        k_set_rows_turbo3_tail<idx_t><<<(int)n_rows, tail_size, 0, stream>>>(
++            src0_d, src1_d, (block_turbo3_0 *)dst->data,
++            ne00, ne01, ne10, ne11, ne12, ne13,
++            s01, s02, s03, s10, s11, s12,
++            nb1, nb2, nb3, tail_size);
++    }
++}
++
++// ---- TurboQuant4 set_rows: 128-element groups with WHT rotation + 4-bit quantization ----
++
++template <typename idx_t>
++__launch_bounds__(128)
++static __global__ void k_set_rows_turbo4(
++        const float * __restrict__ src0,
++        const idx_t * __restrict__ src1,
++        block_turbo4_0 * __restrict__ dst,
++        const int64_t ne00,
++        const int64_t ne01,
++        const int64_t ne10,
++        const int64_t ne11,
++        const int64_t ne12,
++        const int64_t ne13,
++        const int64_t s01,
++        const int64_t s02,
++        const int64_t s03,
++        const int64_t s10,
++        const int64_t s11,
++        const int64_t s12,
++        const int64_t s1,
++        const int64_t s2,
++        const int64_t s3) {
++
++    const int j = threadIdx.x;
++
++    const int64_t n_blocks_per_row = ne00 / QK_TURBO4;
++    const int64_t g = blockIdx.x;
++    const int64_t i_blk = g % n_blocks_per_row;
++    int64_t       tmp   = g / n_blocks_per_row;
++    const int64_t i01   = tmp % ne01;
++    tmp                 = tmp / ne01;
++    const int64_t i02   = tmp % ne12;
++    const int64_t i03   = tmp / ne12;
++
++    const int64_t i12 = i02;
++    const int64_t i11 = i01 % ne11;
++    const int64_t i10 = i01;
++
++    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
++    const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
++    block_turbo4_0 * dst_row_ptr = (block_turbo4_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3);
++    block_turbo4_0 * blk = dst_row_ptr + i_blk;
++
++    __shared__ float x[128];
++    x[j] = src_row[i_blk * QK_TURBO4 + j];
++    __syncthreads();
++
++    constexpr int n_warps = 128 / WARP_SIZE;
++    __shared__ float warp_accum[n_warps];
++    float v = x[j];
++    float v2 = v * v;
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
++        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
++    }
++    if (j % WARP_SIZE == 0) {
++        warp_accum[j / WARP_SIZE] = v2;
++    }
++    __syncthreads();
++
++    __shared__ float s_norm_sq;
++    if (j == 0) {
++        float total = 0.0f;
++        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
++        s_norm_sq = total;
++    }
++    __syncthreads();
++    const float grp_norm = sqrtf(s_norm_sq);
++    const float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
++    x[j] *= inv_norm;
++    __syncthreads();
++
++    x[j] *= TURBO_WHT_SIGNS1[j];
++    __syncthreads();
++
++#define WHT_STAGE_SHARED_T4(h) \
++    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
++    __syncthreads();
++
++    WHT_STAGE_SHARED_T4(1)
++    WHT_STAGE_SHARED_T4(2)
++    WHT_STAGE_SHARED_T4(4)
++    WHT_STAGE_SHARED_T4(8)
++    WHT_STAGE_SHARED_T4(16)
++    WHT_STAGE_SHARED_T4(32)
++    WHT_STAGE_SHARED_T4(64)
++#undef WHT_STAGE_SHARED_T4
++
++    constexpr float inv_sqrt_128 = 0.08838834764831845f;
++    x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
++    __syncthreads();
++
++    const uint8_t idx = turbo_nearest_centroid_4bit(x[j]);
++
++    const int lane = j % WARP_SIZE;
++    const uint8_t my_nibble = idx & 0xF;
++    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
++    if (j % 2 == 0) {
++        blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
++    }
++
++    const float c = TURBO_CENTROIDS_4BIT[idx];
++    float rc = c * c;
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
++        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
++    }
++    if (j % WARP_SIZE == 0) {
++        warp_accum[j / WARP_SIZE] = rc;
++    }
++    __syncthreads();
++
++    __shared__ float s_recon_sq;
++    if (j == 0) {
++        float total = 0.0f;
++        for (int w = 0; w < n_warps; w++) total += warp_accum[w];
++        s_recon_sq = total;
++    }
++    __syncthreads();
++    const float recon_norm = sqrtf(s_recon_sq);
++    const float corrected_norm = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
++
++    if (j == 0) {
++        blk->norm  = __float2half(corrected_norm);
++        blk->rnorm = __float2half(0.0f);
++    }
++
++    GGML_UNUSED(ne10);
++    GGML_UNUSED(ne13);
++}
++
++template<typename idx_t>
++static void set_rows_cuda_turbo4(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        ggml_tensor * dst) {
++
++    const float * src0_d = (const float *)src0->data;
++    const idx_t * src1_d = (const idx_t *)src1->data;
++
++    GGML_TENSOR_BINARY_OP_LOCALS
++    GGML_ASSERT(ne00 % QK_TURBO4 == 0);
++
++    cudaStream_t stream = ctx.stream();
++    const int64_t n_blocks = ne00 / QK_TURBO4;
++
++    const int64_t s01 = nb01/sizeof(float);
++    const int64_t s02 = nb02/sizeof(float);
++    const int64_t s03 = nb03/sizeof(float);
++    const int64_t s10 = nb10/sizeof(idx_t);
++    const int64_t s11 = nb11/sizeof(idx_t);
++    const int64_t s12 = nb12/sizeof(idx_t);
++
++    if (n_blocks > 0) {
++        const int64_t ne_total = n_blocks * ne01 * ne02 * ne03;
++        k_set_rows_turbo4<idx_t><<<(int)ne_total, 128, 0, stream>>>(
++            src0_d, src1_d, (block_turbo4_0 *)dst->data,
++            ne00, ne01, ne10, ne11, ne12, ne13,
++            s01, s02, s03, s10, s11, s12,
++            nb1, nb2, nb3);
++    }
++}
++
+ template <typename src_t, typename idx_t, typename dst_t>
+ static __global__ void k_set_rows(const src_t * src0_ptr,
+                                   const idx_t * src1_ptr,
+@@ -317,6 +856,10 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+             nb1, nb2, nb3,
+             stream
+         );
++    } else if (dst->type == GGML_TYPE_TURBO3_0) {
++        set_rows_cuda_turbo3<idx_t>(ctx, src0, src1, dst);
++    } else if (dst->type == GGML_TYPE_TURBO4_0) {
++        set_rows_cuda_turbo4<idx_t>(ctx, src0, src1, dst);
+     } else {
+         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
+     }
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index 6c1b15b..1d5c002 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -89,18 +89,6 @@ else()
+         ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu)
+ endif()
+-if (GGML_CUDA_FA_ALL_QUANTS)
+-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
+-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
+-    add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+-else()
+-    list(APPEND GGML_SOURCES_ROCM
+-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
+-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
+-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
+-
+-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+-endif()
+ 
+ ggml_add_backend_library(ggml-hip
+                          ${GGML_HEADERS_ROCM}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index e252197..1b94608 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -8150,6 +8150,8 @@ size_t ggml_quantize_chunk(
+         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
++        case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
++        case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+         case GGML_TYPE_F16:
+             {
+                 size_t elemsize = sizeof(ggml_fp16_t);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cc8c004..45a385a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3874,7 +3874,11 @@ llama_context * llama_init_from_model(
+     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
+         const uint32_t blck_size = ggml_blck_size(params.type_k);
+         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
++            uint32_t head_k = model->hparams.n_embd_head_k(il);
++            if (params.type_k == GGML_TYPE_TURBO4_0 && head_k % 128 != 0) {
++                head_k = ((head_k + 127) / 128) * 128;
++            }
++            if (head_k % blck_size != 0) {
+                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
+                     __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
+                 return nullptr;
+@@ -3884,8 +3888,13 @@ llama_context * llama_init_from_model(
+ 
+     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
+         const uint32_t blck_size = ggml_blck_size(params.type_v);
++        const bool is_mla = model->hparams.is_mla();
+         for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+-            if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
++            uint32_t head_v = model->hparams.n_embd_head_v(il);
++            if (params.type_v == GGML_TYPE_TURBO4_0 && !is_mla && head_v % 128 != 0) {
++                head_v = ((head_v + 127) / 128) * 128;
++            }
++            if (head_v % blck_size != 0) {
+                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
+                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
+                 return nullptr;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 99f263e..e4adf94 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2688,6 +2688,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
+         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+ 
++        // TurboQuant V-side: the cache holds V rotated, so undo the rotation on the
++        // attention output. Group size follows the cache's ne[0].
++        if ((v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0)) {
++            const int turbo_group = (v->ne[0] % 128 == 0) ? 128 : 64;
++            if (cur->ne[0] % turbo_group == 0) {
++                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
++                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group);
++            }
++        }
++
+         if (v_mla) {
+ #if 0
+             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
+@@ -2754,6 +2764,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+         cb(kqv, "kqv", il);
+ 
++        // TurboQuant V-side, non-flash-attn path: kqv = V * kq already went through
++        // the rotated V, so undo the rotation here.
++        if ((v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0)) {
++            const int turbo_group = (v->ne[0] % 128 == 0) ? 128 : 64;
++            if (kqv->ne[0] % turbo_group == 0) {
++                if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
++                kqv = ggml_turbo_wht(ctx0, kqv, 1, turbo_group);
++            }
++        }
++
+         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+         if (v_mla) {
+             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+@@ -2835,6 +2855,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
++    // TurboQuant cache types store K rotated. q has to be rotated the same way
++    // before it can be compared against the cached keys.
++    if ((k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
++        if (q->ne[0] % 64 == 0) {
++            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
++            q = ggml_turbo_wht(ctx0, q, 0, 0); // 0 = forward
++        }
++    }
++
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+@@ -2939,6 +2968,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
++    // TurboQuant cache types store K rotated. q has to be rotated the same way
++    // before it can be compared against the cached keys.
++    if ((k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
++        if (q->ne[0] % 64 == 0) {
++            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
++            q = ggml_turbo_wht(ctx0, q, 0, 0); // 0 = forward
++        }
++    }
++
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+@@ -3030,6 +3068,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
++    // TurboQuant cache types store K rotated. q has to be rotated the same way
++    // before it can be compared against the cached keys.
++    if ((k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
++        if (q->ne[0] % 64 == 0) {
++            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
++            q = ggml_turbo_wht(ctx0, q, 0, 0); // 0 = forward
++        }
++    }
++
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+@@ -3115,6 +3162,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
++    // TurboQuant cache types store K rotated. q has to be rotated the same way
++    // before it can be compared against the cached keys.
++    if ((k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
++        if (q->ne[0] % 64 == 0) {
++            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
++            q = ggml_turbo_wht(ctx0, q, 0, 0); // 0 = forward
++        }
++    }
++
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+@@ -3194,6 +3250,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
++    // TurboQuant cache types store K rotated. q has to be rotated the same way
++    // before it can be compared against the cached keys.
++    if ((k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
++        if (q->ne[0] % 64 == 0) {
++            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
++            q = ggml_turbo_wht(ctx0, q, 0, 0); // 0 = forward
++        }
++    }
++
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+@@ -3265,6 +3330,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
++    // TurboQuant cache types store K rotated. q has to be rotated the same way
++    // before it can be compared against the cached keys.
++    if ((k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
++        if (q->ne[0] % 64 == 0) {
++            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
++            q = ggml_turbo_wht(ctx0, q, 0, 0); // 0 = forward
++        }
++    }
++
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+@@ -3324,6 +3398,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
++    // TurboQuant cache types store K rotated. q has to be rotated the same way
++    // before it can be compared against the cached keys.
++    if ((k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
++        if (q->ne[0] % 64 == 0) {
++            if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
++            q = ggml_turbo_wht(ctx0, q, 0, 0); // 0 = forward
++        }
++    }
++
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 3df5ced..68aa8ba 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -210,6 +210,27 @@ llama_kv_cache::llama_kv_cache(
+         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
+         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+ 
++        const bool has_turbo3 = (type_k == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO3_0);
++        const bool has_turbo4 = (type_k == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO4_0);
++        if (has_turbo3 && hparams.n_embd_head_k(il) % 64 != 0) {
++            if (il == 0) {
++                LLAMA_LOG_WARN("%s: turbo3 KV cache requires head_dim divisible by 64, "
++                               "but this model has n_embd_head_k=%u - falling back to q8_0\n",
++                               __func__, hparams.n_embd_head_k(il));
++            }
++            type_k = GGML_TYPE_Q8_0;
++            type_v = GGML_TYPE_Q8_0;
++        }
++        if (has_turbo4 && hparams.n_embd_head_k(il) % 128 != 0) {
++            if (il == 0) {
++                LLAMA_LOG_WARN("%s: turbo4 KV cache requires head_dim divisible by 128, "
++                               "but this model has n_embd_head_k=%u - falling back to q8_0\n",
++                               __func__, hparams.n_embd_head_k(il));
++            }
++            type_k = GGML_TYPE_Q8_0;
++            type_v = GGML_TYPE_Q8_0;
++        }
++
+         const char * dev_name = "CPU";
+ 
+         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+@@ -1347,7 +1368,14 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
+     }
+ 
+     // store the current K values into the cache
+-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
++    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
++
++    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
++        const int32_t wht_group = (n_embd_head % 128 == 0) ? 128 : 64;
++        memcpy(result->op_params, &wht_group, sizeof(int32_t));
++    }
++
++    return result;
+ }
+ 
+ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+@@ -1382,7 +1410,12 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
+             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+         }
+ 
+-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
++        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
++        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
++            const int32_t wht_group = (n_embd_head % 128 == 0) ? 128 : 64;
++            memcpy(result->op_params, &wht_group, sizeof(int32_t));
++        }
++        return result;
+     }
+ 
+     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 67ff970..7fb281b 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -119,6 +119,12 @@ endfunction()
+ # build test-tokenizer-0 target once and add many tests
+ llama_build(test-tokenizer-0.cpp)
+ 
++# TurboQuant ports: the WHT rotation and the turbo3/turbo4 reference codec.
++# These are the ctest gate the fusion promotion protocol refers to as
++# `ctest -R test-turbo`.
++llama_build_and_test(test-turbo-wht.cpp)
++llama_build_and_test(test-turbo-quant-cpu.cpp)
++
+ llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
+ llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
+ llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-coder    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-coder.gguf)
+diff --git a/tests/test-turbo-quant-cpu.cpp b/tests/test-turbo-quant-cpu.cpp
+new file mode 100644
+index 0000000..ac88452
+--- /dev/null
++++ b/tests/test-turbo-quant-cpu.cpp
+@@ -0,0 +1,143 @@
++#include "ggml.h"
++#include "ggml-cpu.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++static double norm_squared(const float * data, int64_t n) {
++    double sum = 0.0;
++    for (int64_t i = 0; i < n; i++) {
++        sum += (double) data[i] * (double) data[i];
++    }
++    return sum;
++}
++
++int main() {
++    const int64_t ne = 128;
++    const int64_t nrows = 1;
++
++    if (ggml_blck_size(GGML_TYPE_TURBO3_0) != 32) {
++        std::fprintf(stderr, "turbo3 block size is %d, expected 32\n",
++                     (int) ggml_blck_size(GGML_TYPE_TURBO3_0));
++        return 1;
++    }
++
++    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO3_0, ne);
++    if (row_size != 4 * 14) {
++        std::fprintf(stderr, "turbo3 row size for 128 values is %zu, expected 56\n", row_size);
++        return 1;
++    }
++
++    std::vector<float> source(ne);
++    for (int64_t i = 0; i < ne; i++) {
++        source[i] = 0.25f * std::sin(0.13f * i) + 0.75f * std::cos(0.041f * i);
++    }
++
++    struct ggml_init_params params = {
++        /*.mem_size   =*/ 16 * 1024 * 1024,
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++    if (ctx == nullptr) {
++        std::fprintf(stderr, "ggml_init failed\n");
++        return 1;
++    }
++
++    struct ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
++    for (int64_t i = 0; i < ne; i++) {
++        ((float *) a->data)[i] = source[i];
++    }
++    struct ggml_tensor * rotated = ggml_turbo_wht(ctx, a, 0, 0);
++    struct ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, rotated);
++    ggml_graph_compute_with_ctx(ctx, gf, 1);
++
++    std::vector<float> rotated_source(ne);
++    for (int64_t i = 0; i < ne; i++) {
++        rotated_source[i] = ((const float *) rotated->data)[i];
++    }
++
++    std::vector<float> input(ne);
++    for (int64_t i = 0; i < ne; i++) {
++        input[i] = source[i];
++    }
++
++    std::vector<uint8_t> quantized(row_size);
++    const size_t written = ggml_quantize_chunk(
++        GGML_TYPE_TURBO3_0, input.data(), quantized.data(), 0, nrows, ne, nullptr);
++    if (written != row_size) {
++        std::fprintf(stderr, "quantize_chunk wrote %zu bytes, expected %zu\n", written, row_size);
++        return 1;
++    }
++
++    std::vector<float> output(ne);
++    ggml_get_type_traits(GGML_TYPE_TURBO3_0)->to_float(quantized.data(), output.data(), ne);
++
++    const double in_norm  = std::sqrt(norm_squared(rotated_source.data(), ne));
++    const double out_norm = std::sqrt(norm_squared(output.data(), ne));
++    if (std::fabs(in_norm - out_norm) > 0.02 * in_norm) {
++        std::fprintf(stderr, "turbo3 norm mismatch: in=%.6f out=%.6f\n", in_norm, out_norm);
++        ggml_free(ctx);
++        return 1;
++    }
++
++    double dot = 0.0;
++    for (int64_t i = 0; i < ne; i++) {
++        dot += (double) rotated_source[i] * (double) output[i];
++    }
++    const double cosine = dot / (in_norm * out_norm);
++    if (cosine < 0.97) {
++        std::fprintf(stderr, "turbo3 cosine too low: %.6f\n", cosine);
++        ggml_free(ctx);
++        return 1;
++    }
++
++    ggml_free(ctx);
++
++    if (ggml_blck_size(GGML_TYPE_TURBO4_0) != 128) {
++        std::fprintf(stderr, "turbo4 block size is %d, expected 128\n",
++                     (int) ggml_blck_size(GGML_TYPE_TURBO4_0));
++        return 1;
++    }
++
++    const size_t row_size4 = ggml_row_size(GGML_TYPE_TURBO4_0, ne);
++    if (row_size4 != 68) {
++        std::fprintf(stderr, "turbo4 row size for 128 values is %zu, expected 68\n", row_size4);
++        return 1;
++    }
++
++    std::vector<uint8_t> quantized4(row_size4);
++    const size_t written4 = ggml_quantize_chunk(
++        GGML_TYPE_TURBO4_0, source.data(), quantized4.data(), 0, nrows, ne, nullptr);
++    if (written4 != row_size4) {
++        std::fprintf(stderr, "turbo4 quantize_chunk wrote %zu bytes, expected %zu\n", written4, row_size4);
++        return 1;
++    }
++
++    std::vector<float> output4(ne);
++    ggml_get_type_traits(GGML_TYPE_TURBO4_0)->to_float(quantized4.data(), output4.data(), ne);
++
++    const double in_norm4  = std::sqrt(norm_squared(rotated_source.data(), ne));
++    const double out_norm4 = std::sqrt(norm_squared(output4.data(), ne));
++    if (std::fabs(in_norm4 - out_norm4) > 0.02 * in_norm4) {
++        std::fprintf(stderr, "turbo4 norm mismatch: in=%.6f out=%.6f\n", in_norm4, out_norm4);
++        return 1;
++    }
++
++    double dot4 = 0.0;
++    for (int64_t i = 0; i < ne; i++) {
++        dot4 += (double) rotated_source[i] * (double) output4[i];
++    }
++    const double cosine4 = dot4 / (in_norm4 * out_norm4);
++    if (cosine4 < 0.99) {
++        std::fprintf(stderr, "turbo4 cosine too low: %.6f\n", cosine4);
++        return 1;
++    }
++
++    std::printf("test-turbo-quant-cpu: block=32 row_size=56 norm=%.6f cosine=%.6f\n",
++                out_norm, cosine);
++    return 0;
++}
+diff --git a/tests/test-turbo-wht.cpp b/tests/test-turbo-wht.cpp
+new file mode 100644
+index 0000000..b20d083
+--- /dev/null
++++ b/tests/test-turbo-wht.cpp
+@@ -0,0 +1,85 @@
++#include "ggml.h"
++#include "ggml-cpu.h"
++
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++static bool close_enough(float a, float b, float rel_tol) {
++    const float scale = std::fmax(1.0f, std::fabs(a));
++    return std::fabs(a - b) <= rel_tol * scale;
++}
++
++int main() {
++    const int64_t ne0 = 128;
++    const int64_t ne1 = 3;
++    const int64_t n = ne0 * ne1;
++
++    struct ggml_init_params params = {
++        /*.mem_size   =*/ 16 * 1024 * 1024,
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++    if (ctx == nullptr) {
++        std::fprintf(stderr, "ggml_init failed\n");
++        return 1;
++    }
++
++    struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
++    std::vector<float> input(n);
++    for (int64_t i = 0; i < n; i++) {
++        input[i] = 0.25f * std::sin(0.13f * i) + 0.75f * std::cos(0.041f * i);
++        ((float *) a->data)[i] = input[i];
++    }
++
++    struct ggml_tensor * fwd = ggml_turbo_wht(ctx, a, 0, 0);
++    struct ggml_tensor * round = ggml_turbo_wht(ctx, fwd, 1, 0);
++    struct ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, round);
++    ggml_graph_compute_with_ctx(ctx, gf, 1);
++
++    float max_rel = 0.0f;
++    const float * output = (const float *) round->data;
++    for (int64_t i = 0; i < n; i++) {
++        const float rel = std::fabs(output[i] - input[i]) / std::fmax(1.0f, std::fabs(input[i]));
++        if (rel > max_rel) {
++            max_rel = rel;
++        }
++    }
++
++    const int64_t ne0_64 = 64;
++    const int64_t ne1_64 = 2;
++    const int64_t n_64 = ne0_64 * ne1_64;
++
++    struct ggml_tensor * a_64 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0_64, ne1_64);
++    std::vector<float> input_64(n_64);
++    for (int64_t i = 0; i < n_64; i++) {
++        input_64[i] = 0.35f * std::cos(0.17f * i) + 0.65f * std::sin(0.053f * i);
++        ((float *) a_64->data)[i] = input_64[i];
++    }
++
++    struct ggml_tensor * fwd_64 = ggml_turbo_wht(ctx, a_64, 0, 64);
++    struct ggml_tensor * round_64 = ggml_turbo_wht(ctx, fwd_64, 1, 64);
++    struct ggml_cgraph * gf_64 = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf_64, round_64);
++    ggml_graph_compute_with_ctx(ctx, gf_64, 1);
++
++    const float * output_64 = (const float *) round_64->data;
++    for (int64_t i = 0; i < n_64; i++) {
++        const float rel = std::fabs(output_64[i] - input_64[i]) / std::fmax(1.0f, std::fabs(input_64[i]));
++        if (rel > max_rel) {
++            max_rel = rel;
++        }
++    }
++
++    ggml_free(ctx);
++
++    if (!close_enough(max_rel, 0.0f, 1e-5f)) {
++        std::fprintf(stderr, "forward(inverse(x)) mismatch: max_rel=%.9f\n", max_rel);
++        return 1;
++    }
++
++    std::printf("test-turbo-wht: max_rel=%.9f\n", max_rel);
++    return 0;
++}
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index a2da93b..cd45174 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -500,6 +500,16 @@ static ggml_type ggml_type_from_name(const std::string & s) {
+     if (s == "iq4_nl") {
+         return GGML_TYPE_IQ4_NL;
+     }
++    // TurboQuant KV cache types ported onto this baseline. `llama-bench` drives the
++    // performance gate in fusion/test-and-benchmark-protocol.md, so the names used by
++    // `llama-server --cache-type-k/-v` must resolve here too. The mapping is
++    // intentionally the same "turbo3"/"turbo4" spelling as common/arg.cpp.
++    if (s == "turbo3") {
++        return GGML_TYPE_TURBO3_0;
++    }
++    if (s == "turbo4") {
++        return GGML_TYPE_TURBO4_0;
++    }
+ 
+     return GGML_TYPE_COUNT;
+ }

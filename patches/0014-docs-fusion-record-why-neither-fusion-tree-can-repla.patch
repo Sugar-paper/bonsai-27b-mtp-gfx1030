@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): record why neither fusion tree can replace the
+ other
+
+Both trees now do turbo3/turbo4 KV correctly, so that is no longer the separator.
+Two things are:
+
+- The private type sets are disjoint. TQ3_1S/TQ4_1S (45/46) exist only on the b11046
+  branch; PQ2_0/PTQ1_0 (142/143) exist only here. Measured, not inferred:
+  llama-cli -m Ternary-Bonsai-2-27B-PQ2_0.gguf on b11046 -> rc=1 in 1 s with
+  "tensor 'output.weight' has invalid ggml type 142. should be in [0, 47)".
+- Turbo KV is at parity: SC117 head_dim 256, f16 6.9921 vs 6.9422, turbo3 7.1292 vs
+  7.1626, turbo4 7.0756 vs 7.0895. Neither tree is better at it.
+
+Also records the deployment split read out of the launchers (Bonsai -> this tree's
+build-hip; SC117 and ISTA -> the promoted b10335 runtime), so the two trees are not
+two copies of one thing, and the direction of any future consolidation: port
+PrismQL's private types forward onto b11046, never move b11046 back 430 commits
+(35 of them in ggml-cuda, 75 in src/, including FA correctness fixes).
+---
+ fusion/state.json           | 64 +++++++++++++++++++++++++++++++-
+ fusion/upstream-sync-log.md | 73 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+), 2 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index 3f24587..5a56ccd 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -198,7 +198,7 @@
+     "gpuArchitecture": "gfx1030",
+     "rocm": "7.1"
+   },
+-  "updatedAt": "2026-09-19T19:35:00+08:00",
++  "updatedAt": "2026-09-19T19:45:00+08:00",
+   "buildRecommendation": {
+     "faAllQuants": "Either. Correctness was previously thought to depend on this; it does not - both configurations now measure 6.94-7.13 across the whole K/V matrix and both pass test-backend-ops FLASH_ATTN_EXT with zero failures. ON compiles every combination (447 s full rebuild, and no silent f16 fallback for exotic pairs); OFF compiles four plus the TurboQuant instances (much shorter build). This worktree is currently left ON.",
+     "hipGraphs": "GGML_HIP_GRAPHS is ON in this CMakeCache and the define is present in build.ninja (154 references), so unlike an earlier note it is NOT inert. It is also not a factor: running with GGML_CUDA_DISABLE_GRAPHS=1 reproduced the 307 failures byte-identically.",
+@@ -286,5 +286,65 @@
+       "verdict": "superseded numbers",
+       "why": "verification.ctest.perplexity was taken on the broken build: q8_0 329.4764, turbo3 8038.7921, turbo4 4064.1819. The f16 number (10.6801) is still valid; the other three are not comparable and are kept only as the pre-fix record."
+     }
+-  ]
++  ],
++  "canEitherTreeReplaceTheOther": "no - measured 2026-09-19, and the block is a hard one, not a matter of degree",
++  "privateTypeSets": {
++    "note": "each tree carries private tensor types the other cannot decode, so neither is a superset",
++    "shared": {
++      "TURBO3_0 = 43 (KV)": true,
++      "TURBO4_0 = 44 (KV)": true
++    },
++    "prismOnly": [
++      "PQ2_0 = 142 (ternary weight, group 128)",
++      "PTQ1_0 = 143 (ternary weight, group 128)"
++    ],
++    "b11046Only": [
++      "TQ3_1S = 45 (weight, block 32)",
++      "TQ4_1S = 46 (weight, block 32)"
++    ],
++    "proofB11046CannotRunBonsai": "llama-cli -m Ternary-Bonsai-2-27B-PQ2_0.gguf -> rc=1 in 1 s: gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 142. should be in [0, 47)",
++    "proofPrismCannotReadTqWeights": "ggml.h on this branch declares TURBO3_0/TURBO4_0 but no TQ3_1S/TQ4_1S, so a GGUF using the turboquant weight types has no entry here",
++    "recordPath": "temp_clean_later/bench-results/tree-equivalence/b11046-load-bonsai.log"
++  },
++  "turboKvParity": {
++    "date": "2026-09-19",
++    "model": "SC117 Qwen3.6-35B-A3B, head_dim 256",
++    "settings": "-c 512 -fa 1 --chunks 8 -ngl 999, wiki.test.raw",
++    "prism": {
++      "f16/f16": 6.9921,
++      "turbo3/turbo3": 7.1292,
++      "turbo4/turbo4": 7.0756
++    },
++    "b11046": {
++      "f16/f16": 6.9422,
++      "turbo3/turbo3": 7.1626,
++      "turbo4/turbo4": 7.0895
++    },
++    "verdict": "turbo KV is at parity across the two trees; the capability is no longer a reason to prefer either one. It was only ever the *model coverage* and the upstream base that separate them.",
++    "recordPath": "temp_clean_later/bench-results/tree-equivalence"
++  },
++  "deployedRoles": {
++    "note": "read out of the launchers, so this is what actually runs, not what could run",
++    "bonsai-2-27b": {
++      "launcher": "<MODELS>/Bonsai-2-27B/start-bonsai.bat",
++      "binary": "sources/PrismML-turboquant-fusion/build-hip/bin",
++      "why": "the ternary PQ2_0 model cannot load anywhere else"
++    },
++    "sc117-and-ista": {
++      "launchers": [
++        ".../SC117/.../start-fast.bat",
++        ".../SC117/.../start-200k.bat",
++        ".../ISTA-DASLab/.../start-256k.bat"
++      ],
++      "binary": "runtimes/llama.cpp-turboquant-fusion-rocm71-gfx1030-b10335",
++      "why": "a promoted runtime, with published 200k-context and MTP measurements tied to it"
++    },
++    "conclusion": "the two trees already occupy different slots; this is not two copies of one thing"
++  },
++  "consolidationIfWanted": {
++    "direction": "forward only",
++    "what": "port PrismML private types (PQ2_0 142 / PTQ1_0 143: block layout, CPU codec, MMQ/MMVQ/MMF kernels, dequantize, convert tables) onto the upstream b11046 base, so Bonsai also rides the newer upstream",
++    "whyNotBackward": "moving b11046 back to the PrismML base (merge-base b10615-1) would drop 430 upstream commits, of which 35 touch ggml/src/ggml-cuda and 75 touch src/ - including FA correctness fixes (b74f590ea fix divergent barrier in f16 flash attention) and the BF16-acceleration fallback (ad6c66839) that gfx1030 needs. That is pure regression.",
++    "cost": "a real porting job, but the same shape as the one already done twice, and the audit script now exists to prove nothing is silently dropped"
++  }
+ }
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+index 48bc36b..4472932 100644
+--- a/fusion/upstream-sync-log.md
++++ b/fusion/upstream-sync-log.md
+@@ -670,3 +670,76 @@ defective. Neither local model has a 128-wide head (both `qwen35` with `key_leng
+ it cannot be re-measured without fetching a small head_dim 128 model. At head_dim 256
+ every turbo pairing is healthy (7.04-7.13, both configurations).
+ 
++---
++
++## Can this tree replace llama.cpp-turboquant-fusion? No - measured (2026-09-19)
++
++Both trees now do turbo3/turbo4 KV correctly, so the capability that used to be the
++headline is no longer what separates them. Two things do, and both are hard blocks
++rather than matters of degree.
++
++### 1. The private type sets are disjoint
++
++| type | this tree (PrismML base) | llama.cpp-turboquant fusion (b11046) |
++| --- | --- | --- |
++| TURBO3_0 = 43 (KV cache) | yes | yes |
++| TURBO4_0 = 44 (KV cache) | yes | yes |
++| TQ3_1S = 45 (weight, block 32) | **no** | yes |
++| TQ4_1S = 46 (weight, block 32) | **no** | yes |
++| PQ2_0 = 142 (ternary weight, group 128) | yes | **no** |
++| PTQ1_0 = 143 (ternary weight, group 128) | yes | **no** |
++
++Neither tree is a superset. `ggml.h` on the b11046 branch stops at `GGML_TYPE_COUNT =
++47`, so the target model cannot even be opened there:
++
++```text
++$ llama-cli -m Ternary-Bonsai-2-27B-PQ2_0.gguf -p hi -n 1 -c 256
++gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 142. should be in [0, 47)
++rc=1 in 1 s
++```
++
++Record: `bench-results/tree-equivalence/b11046-load-bonsai.log`.
++
++### 2. Turbo KV is at parity, so neither tree wins on it
++
++SC117, head_dim 256, `-c 512 -fa 1 --chunks 8 -ngl 999`:
++
++| KV | this tree | b11046 tree |
++| --- | --- | --- |
++| f16 x f16 | 6.9921 | 6.9422 |
++| turbo3 x turbo3 | 7.1292 | 7.1626 |
++| turbo4 x turbo4 | 7.0756 | 7.0895 |
++
++Same-GPU, same model, same settings. Both are healthy; the deltas against their own
++f16 are +2.0% and +3.2% for turbo3, which is the same order as the cross-build
++difference on f16 alone.
++
++### They already occupy different slots
++
++Read out of the launchers, so this is what runs rather than what could run:
++
++| model | entry point | binary |
++| --- | --- | --- |
++| Ternary-Bonsai-2-27B | `start-bonsai.bat` | `sources/PrismML-turboquant-fusion/build-hip/bin` |
++| SC117 (fast / 200k) | `start-fast.bat`, `start-200k.bat` | `runtimes/llama.cpp-turboquant-fusion-rocm71-gfx1030-b10335` |
++| ISTA Qwen3.8-27B (256k) | `start-256k.bat` | same promoted runtime |
++
++So this is not two copies of one thing: one is the ternary model's build, the other is
++the promoted serving runtime for everything else.
++
++### If consolidation is ever wanted, the direction is forward
++
++Port the PrismML-private types (PQ2_0 142 / PTQ1_0 143: block layout, CPU codec,
++MMQ/MMVQ/MMF kernels, dequantise, convert tables) **onto the b11046 base**, so Bonsai
++also rides the newer upstream. Going the other way - moving b11046 back to this tree's
++merge-base (`b10615-1`) - would drop 430 upstream commits, 35 of them in
++`ggml/src/ggml-cuda` and 75 in `src/`, including FA correctness work such as
++`b74f590ea fix divergent barrier in f16 flash attention` and the
++`ad6c66839` BF16-acceleration fallback that a gfx1030 host needs. That direction is
++pure regression and should not be on the table.
++
++The cost of that forward port is real, but it is the same shape as the one already done
++twice, and `scripts/audit-port-deletions.py` now exists to prove nothing is silently
++dropped along the way.
++
++

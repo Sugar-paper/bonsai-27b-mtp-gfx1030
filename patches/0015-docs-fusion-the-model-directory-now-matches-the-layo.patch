@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): the model directory now matches the layout LM
+ Studio indexes
+
+LM Studio only indexes <models-dir>/<publisher>/<repo>/file.gguf - exactly two levels.
+The four Bonsai packs sat one level deep in Bonsai-2-27B/, so the app reported nothing
+while the sibling SC117/, ISTA-DASLab/ and ggml-org/ folders all appeared.
+
+lms ls went from 4 models / 28.64 GB with no Bonsai to 8 models / 57.46 GB including
+ternary-bonsai-2-27b, ternary-bonsai-2-27b-derisked,
+ternary-bonsai-2-27b-uncensored-heretic and bonsai-2-27b-ternary-crack.
+
+The packs are from four different Hugging Face publishers (named in
+scripts/download-bonsai.sh), so each got its own publisher/repo folder rather than a
+shared one; while they briefly shared prism-ml/, lms labelled them all by that path.
+
+start-bonsai.bat moved with the official pack and now derives its model path from
+%~dp0, so the next rename cannot break it. Verified: --list sees ROCm0, --cli answers
+correctly, and the resolved path is the new one.
+
+Still open: no mmproj-*.gguf, so the vision tower is unavailable - the sibling models
+both ship one.
+---
+ fusion/state.json | 33 ++++++++++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index 5a56ccd..585a7b0 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -198,7 +198,7 @@
+     "gpuArchitecture": "gfx1030",
+     "rocm": "7.1"
+   },
+-  "updatedAt": "2026-09-19T19:45:00+08:00",
++  "updatedAt": "2026-09-19T20:05:00+08:00",
+   "buildRecommendation": {
+     "faAllQuants": "Either. Correctness was previously thought to depend on this; it does not - both configurations now measure 6.94-7.13 across the whole K/V matrix and both pass test-backend-ops FLASH_ATTN_EXT with zero failures. ON compiles every combination (447 s full rebuild, and no silent f16 fallback for exotic pairs); OFF compiles four plus the TurboQuant instances (much shorter build). This worktree is currently left ON.",
+     "hipGraphs": "GGML_HIP_GRAPHS is ON in this CMakeCache and the define is present in build.ninja (154 references), so unlike an earlier note it is NOT inert. It is also not a factor: running with GGML_CUDA_DISABLE_GRAPHS=1 reproduced the 307 failures byte-identically.",
+@@ -207,9 +207,10 @@
+   },
+   "scope": {
+     "targetModel": "Ternary-Bonsai-2-27B (PrismML ternary PQ2_0, qwen35 arch, head_dim 256)",
+-    "launcher": "<MODELS>/Bonsai-2-27B/start-bonsai.bat",
++    "launcher": "<MODELS>/prism-ml/Ternary-Bonsai-2-27B-gguf/start-bonsai.bat",
+     "kvConfig": "The launcher does not pass -ctk/-ctv, so the model runs on the default f16 KV cache.",
+-    "consequence": "f16 x f16 is healthy in every configuration measured, and after the dequantize_q8_0 fix every other K/V combination is too. The one remaining unverified item is turbo KV at head_dim 128, which is outside this model's geometry (key_length 256)."
++    "consequence": "f16 x f16 is healthy in every configuration measured, and after the dequantize_q8_0 fix every other K/V combination is too. The one remaining unverified item is turbo KV at head_dim 128, which is outside this model's geometry (key_length 256).",
++    "launcherNote": "moved 2026-09-19 when the pack was put into the LM-Studio-indexable two-level layout; the launcher now derives its model path from %~dp0"
+   },
+   "lastValidation": {
+     "date": "2026-09-19",
+@@ -346,5 +347,31 @@
+     "what": "port PrismML private types (PQ2_0 142 / PTQ1_0 143: block layout, CPU codec, MMQ/MMVQ/MMF kernels, dequantize, convert tables) onto the upstream b11046 base, so Bonsai also rides the newer upstream",
+     "whyNotBackward": "moving b11046 back to the PrismML base (merge-base b10615-1) would drop 430 upstream commits, of which 35 touch ggml/src/ggml-cuda and 75 touch src/ - including FA correctness fixes (b74f590ea fix divergent barrier in f16 flash attention) and the BF16-acceleration fallback (ad6c66839) that gfx1030 needs. That is pure regression.",
+     "cost": "a real porting job, but the same shape as the one already done twice, and the audit script now exists to prove nothing is silently dropped"
++  },
++  "modelLayout": {
++    "why": "LM Studio only indexes <models-dir>/<publisher>/<repo>/file.gguf - exactly two levels. A file one level deep is not indexed and the app reports nothing, which is why the four Bonsai packs were invisible while the sibling SC117/, ISTA-DASLab/ and ggml-org/ folders all appeared.",
++    "modelsRoot": "<MODELS>, reached two ways: the junction <STACK>/models and the symlink <HOME>/.lmstudio/models -> /f/AI/lm-models",
++    "before": "<MODELS>/Bonsai-2-27B/{4 .gguf, start-bonsai.bat}   (one level - not indexed)",
++    "after": {
++      "prism-ml/Ternary-Bonsai-2-27B-gguf": [
++        "Ternary-Bonsai-2-27B-PQ2_0.gguf",
++        "start-bonsai.bat"
++      ],
++      "OS-Software/Ternary-Bonsai-2-27B-Uncensored-Heretic-GGUF": [
++        "Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf"
++      ],
++      "dealignai/Bonsai-2-27B-Ternary-CRACK-GGUF": [
++        "Bonsai-2-27B-PQ2_0-CRACK.gguf"
++      ],
++      "Blackfrost-AI/TERNARY-BONSAI-2-27B-DERISKED-GGUF": [
++        "TERNARY-BONSAI-2-27B-DERISKED-PQ2_0.gguf"
++      ]
++    },
++    "whyFourRepos": "the four packs are from four different Hugging Face publishers, named in temp_clean_later/scripts/download-bonsai.sh. When all four were briefly placed under prism-ml/ as one repo, lms ls labelled them all by the shared publisher path; after the split each gets its own model name.",
++    "proof": "lms ls before: 4 models, 28.64 GB, no Bonsai. After: 8 models, 57.46 GB, including ternary-bonsai-2-27b, ternary-bonsai-2-27b-derisked, ternary-bonsai-2-27b-uncensored-heretic and bonsai-2-27b-ternary-crack.",
++    "launcher": "start-bonsai.bat now derives its model path from %~dp0, so a future rename of the publisher/repo folders cannot break it again.",
++    "movedWith": "temp_clean_later/scripts/restructure-bonsai-layout.py (same-volume renames only, sizes verified, idempotent)",
++    "open": "no mmproj-*.gguf is present, so the vision tower is unavailable. The upstream repo ships it; LM Studio would auto-pair an mmproj file placed in the same repo folder.",
++    "date": "2026-09-19"
+   }
+ }

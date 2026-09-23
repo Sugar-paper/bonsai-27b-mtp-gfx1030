@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): localise defect A to the V side and rule out
+ seven causes
+
+Splitting the two sides of the cache on the pristine PrismML build, SC117,
+head_dim 256:
+
+  q8_0 K + f16 V  -> 7.3955   fine
+  f16 K + q8_0 V  -> 92.5372  broken
+  q8_0 K + q4_0 V -> 7.4975   fine
+  q4_0 K + q8_0 V -> 88.6076  broken
+
+Whenever V is q8_0 the result is garbage and the K type is irrelevant, which is a
+much sharper statement than "q8_0 KV is broken" and matches the kernels: K is
+consumed by a dot product against its quantized form, V is dequantised first.
+
+Seven causes eliminated, each by measurement:
+
+  * PrismML's KV mean-centering - the cpy_k() hook is guarded by a k_bar that is
+    only filled when --kv-mean-center is passed, and it never was.
+  * the attention rotation - LLAMA_ATTN_ROT_DISABLE=1 moves the number but fixes
+    nothing, and leaves the control healthy.
+  * HIP CUDA graphs, the one compile-time difference between the two builds -
+    GGML_CUDA_DISABLE_GRAPHS=1 gives byte-identical numbers, so perplexity does not
+    exercise that path. Still worth aligning the option.
+  * their convert.cu (+117) and dequantize.cuh (+29) edits - private types only, no
+    q8_0 line at all.
+  * a missing upstream FA fix - 3 commits to fattn-vec.cuh in the whole range, none
+    about quantized V.
+  * the FA kernel at head_dim 128 - zero test-backend-ops failures there.
+  * the TurboQuant port - reproduces without any TurboQuant code.
+
+Next is a build-level bisect from the merge-base. git worktree add hangs on the
+whole-tree checkout here, so it has to be exported with git archive instead. Also
+recorded the hard way: do NOT run git worktree prune in this environment, it
+deleted the whole .git/worktrees/ directory and dropped both fusion worktree
+registrations (all data intact, restored by hand).
+---
+ fusion/state.json           | 21 +++++++++--
+ fusion/upstream-sync-log.md | 73 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 90 insertions(+), 4 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index 23ad0d2..1f55e03 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -116,13 +116,28 @@
+       },
+       "whyItMatters": "This is what the q8_0 numbers in the entry below were mistakenly attributed to. The fusion's quality fixtures are head_dim 128 and PrismML's q8_0 is broken there, so any A/B against q8_0 on this base is meaningless until this is understood.",
+       "hint": "PrismML's own KV work is scoped to Q4_0 by construction - the mean-centering feature rejects any K type other than Q4_0, and the docs say Q4_0 only. q4_0 working while q8_0 does not is consistent with a fork that only ever validated the Q4_0 path. Their 93 own commits touched llama-kv-cache.cpp (2), llama-context.cpp (7) and llama-graph.cpp (8), and no FA file at all, so the FA kernels are upstream's.",
++      "localisedTo": {
++        "side": "V only, not K",
++        "evidence": {
++          "q8_0K_f16V": 7.3955,
++          "f16K_q8_0V": 92.5372,
++          "q8_0K_q4_0V": 7.4975,
++          "q4_0K_q8_0V": 88.6076
++        },
++        "statement": "Whenever V is q8_0 the result is garbage and the K type does not matter. This lines up with the kernels: K is consumed by a dot product against its quantized form, V is dequantised first.",
++        "recordPath": "temp_clean_later/bench-results/prism-kv-quadrant"
++      },
+       "ruledOut": [
+         "The TurboQuant port: this reproduces on the pristine build with no TurboQuant code.",
+         "Head size: it fails at 128 and at 256.",
+-        "An upstream fix this base predates. Between the prism merge-base (5ea87ddad) and b11046 the FA vec file only saw 3 commits (73a43d1f6, 8e93a9773, 16378d93f), none about head sizes or quantized KV.",
+-        "The FA kernel at head_dim 128: test-backend-ops reports zero FLASH_ATTN_EXT failures at hsk=128 in this build, so the op is numerically right and the breakage is at the graph / cache level."
++        "PrismML's KV mean-centering (7fb3d5b, 36d1dee). The cpy_k() hook is guarded by k_bar non-empty, k_bar is filled only by load_kv_mean_center(), and that runs only with --kv-mean-center, which was never passed.",
++        "The attention rotation. LLAMA_ATTN_ROT_DISABLE=1 moves the number (92.2627 -> 104.8927, so the switch is live) without fixing anything, and leaves the control healthy (10.7160 -> 10.6632).",
++        "HIP CUDA graphs, the one compile-time option where the builds differ (this one GGML_HIP_GRAPHS=ON, the llama.cpp fusion OFF). GGML_CUDA_DISABLE_GRAPHS=1 gives byte-identical numbers including the f16 control, so perplexity does not exercise that path. Aligning the option is still worthwhile.",
++        "PrismML's edits to convert.cu (+117) and dequantize.cuh (+29): both only add their private types and contain no q8_0 line at all.",
++        "A missing upstream fix in the FA files: fattn-vec.cuh saw 3 commits between the merge-base and b11046, fattn-common.cuh 2, set-rows.cu / cpy.cu / dequantize.cuh none, none about quantized V.",
++        "The FA kernel at head_dim 128: test-backend-ops reports zero FLASH_ATTN_EXT failures at hsk=128, so the op is numerically right at that size."
+       ],
+-      "nextStep": "Diff PrismML's llama-kv-cache.cpp against its own merge-base and check the cpy_k() path for a Q4_0-only assumption that q8_0 violates. q4_0 working and q8_0 not is the whole clue."
++      "nextStep": "Build-level bisect, which needs a build of the merge-base 5ea87ddad. git worktree add hangs on the whole-tree checkout in this environment; export with git archive | tar -x instead. If the merge-base is also broken the regression is upstream's (somewhere in the 430 commits this base lacks); if it is clean, bisect PrismML's 93 own commits."
+     },
+     {
+       "id": "turbo-kv-broken-at-head-dim-128",
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+index b74d924..dd7de90 100644
+--- a/fusion/upstream-sync-log.md
++++ b/fusion/upstream-sync-log.md
+@@ -271,7 +271,6 @@ already been taken on the other runtime. **Cross-runtime comparisons need the sa
+ control run on both runtimes.**
+ 
+ ### Op-level localisation, kept because it still holds
+-
+ `test-backend-ops` (built here with tests ON) on this build:
+ 
+ ```text
+@@ -290,3 +289,75 @@ One trap worth recording: the first run of that instrument reported
+ `failed to initialize ROCm: no ROCm-capable device is detected` and silently tested
+ only the CPU backend, because the script put ROCm's `bin` ahead of the compat
+ runtime on PATH. The compat directory has to come first.
++
++## 2026-09-19 (final): defect A localised to the V side, seven causes ruled out
++
++Chasing defect A on the pristine PrismML build (SC117, head_dim 256,
++`-c 512 -fa 1 --chunks 8 -ngl 999`, corpus wiki.test.raw).
++
++### It is the V cache, not the K cache
++
++Splitting the two sides of the cache:
++
++| K | V | PPL | |
++| --- | --- | --- | --- |
++| q8_0 | f16 | 7.3955 | fine |
++| f16 | q8_0 | **92.5372** | broken |
++| q8_0 | q4_0 | 7.4975 | fine |
++| q4_0 | q8_0 | **88.6076** | broken |
++
++**Whenever V is q8_0 the result is garbage; the K type is irrelevant.** That is a
++much sharper statement than "q8_0 KV is broken", and it lines up with how the
++attention kernels work: K is consumed by a dot product against its quantized form,
++while V is dequantised first.
++
++### Ruled out, each by measurement rather than reasoning
++
++1. **PrismML's KV mean-centering** (`7fb3d5b`, `36d1dee`) - the only fork-specific
++   KV surgery in the tree, so the obvious suspect. The `cpy_k()` hook is guarded by
++   `if (!k_bar.empty() && k_bar[ikv] != nullptr)`, `k_bar` is filled only by
++   `load_kv_mean_center()`, and that runs only when `--kv-mean-center` is passed. It
++   was never passed, so it is dead code for these runs.
++2. **The attention rotation** (`attn_rot_k` / `attn_rot_v`, auto-enabled whenever the
++   cache type is quantized). `LLAMA_ATTN_ROT_DISABLE=1` leaves q8_0 broken
++   (92.2627 -> 104.8927: the number moves, so the switch works, but nothing is fixed)
++   and leaves the control healthy (llama.cpp base, q8_0 at head_dim 128:
++   10.7160 -> 10.6632).
++3. **HIP CUDA graphs**, the one compile-time option where the two builds differ
++   (PrismML `GGML_HIP_GRAPHS=ON`, llama.cpp fusion `OFF`). Disabling at run time with
++   `GGML_CUDA_DISABLE_GRAPHS=1` gives **byte-identical** numbers, including for the
++   f16 control, so perplexity does not exercise the graph path and this option cannot
++   explain the difference. Still worth aligning between the two builds.
++4. **PrismML's own edits to `convert.cu`** (+117 lines) and **`dequantize.cuh`**
++   (+29 lines): both only add their private types (PQ2_0, PTQ1_0, Q2_0_g128) and
++   contain **no q8_0 line at all**.
++5. **A missing upstream fix in the FA files.** Between the merge-base and b11046,
++   `fattn-vec.cuh` saw 3 commits, `fattn-common.cuh` 2, and `set-rows.cu`, `cpy.cu`
++   and `dequantize.cuh` none - none about quantized V.
++6. **The FA kernel itself** at head_dim 128 (test-backend-ops: zero failures there).
++7. **The TurboQuant port** - this reproduces on a build with no TurboQuant code.
++
++### Where that leaves it
++
++A bug in PrismML's base specific to `q8_0` used as the **V** cache type, at any head
++size, with `q4_0` and `f16` as working controls. Everything the two sides share is
++now excluded, and the fault is not in any file PrismML touched with an obvious q8_0
++suspect.
++
++The next step is a build-level bisect, which needs a build of the merge-base
++(`5ea87ddad`). That was attempted with `git worktree add` and **hung** - the
++whole-tree-checkout pathology this project recorded on 2026-09-15. Use
++`git archive 5ea87ddad | tar -x` into a plain directory instead, then bisect:
++
++* if the merge-base is also broken, the regression is upstream's and the fix sits
++  somewhere in the 430 commits this base lacks;
++* if the merge-base is clean, bisect PrismML's 93 own commits (roughly 7 build cycles).
++
++**Do not run `git worktree prune` in this environment.** It deleted
++`<LLAMA_SRC>/llama.cpp/.git/worktrees/` outright and dropped both fusion
++worktree registrations - `git worktree list` afterwards showed only the main
++checkout. The directories, branches and commits were all intact and were restored by
++re-creating `gitdir` / `HEAD` / `commondir` under `.git/worktrees/<name>` by hand,
++plus a `git reset` to rebuild the index. `git worktree repair` cannot help: it needs
++the admin entry in order to locate the repository, which is exactly what is gone.
++Script: `temp_clean_later/scripts/restore-worktree-admin.py`.

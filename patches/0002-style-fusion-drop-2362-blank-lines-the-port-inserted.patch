@@ -1,0 +1,4835 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] style(fusion): drop 2362 blank lines the port inserted after
+ every line
+
+The TurboQuant port emitted every line of these five files followed by an empty
+line, which doubled their length without changing a single statement:
+
+  ggml/src/CMakeLists.txt            632 -> 1265 lines (real additions: 2)
+  ggml/src/ggml-cuda/CMakeLists.txt  281 ->  581 lines (real additions: 21)
+  ggml/src/ggml-hip/CMakeLists.txt   153 ->  323 lines (real additions: 20)
+  ggml/src/ggml-cuda/convert.cu      822 -> 1645 lines (real additions: 2)
+  ggml/src/ggml-cuda/dequantize.cuh  481 ->  978 lines (real additions: 17)
+
+The port spliced its own lines in without that trailing blank, which breaks a
+naive odd/even split, so the rebuild aligned the non-blank line sequences against
+the pristine 9a9394a version and replayed only the real insertions. Checked before
+writing: the non-blank line sequence of every rebuilt file is identical to what it
+was, so no statement could be lost or reordered.
+
+The real additions are preserved in full:
+  CMakeLists   ggml-turbo-quant.c in the ggml-base sources, turbo FA vec instances
+  convert.cu   #include "turbo-quant.cuh"
+  dequantize.cuh  dequantize_turbo3_0 / dequantize_turbo4_0
+
+Verified after the change:
+  BUILD_OK
+  ggml-base.dll still carries the "turbo3"/"turbo4" type names (6 / 4 hits)
+  qwen2.5-1.5B q8_0     -> "The capital of France is Paris", 1529.3 / 151.2 t/s
+  Ternary-Bonsai PQ2_0  -> 69.2 / 40.9 t/s
+
+That these files are diffable again matters now rather than later: the TurboQuant
+cache types are still not usable in this worktree (common/arg.cpp never got the
+type names), so this is the first step of completing the fusion.
+---
+ ggml/src/CMakeLists.txt           | 633 +----------------------
+ ggml/src/ggml-cuda/CMakeLists.txt | 281 +---------
+ ggml/src/ggml-cuda/convert.cu     | 827 +-----------------------------
+ ggml/src/ggml-cuda/dequantize.cuh | 483 +----------------
+ ggml/src/ggml-hip/CMakeLists.txt  | 150 ------
+ 5 files changed, 6 insertions(+), 2368 deletions(-)
+
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 06cb923..d869fa6 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -1,1265 +1,634 @@
+ include(CheckCXXCompilerFlag)
+-
+ include("../cmake/common.cmake")
+ 
+-
+-
+ add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
+ 
+-
+-
+ # enable libstdc++ assertions for debug builds
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+-
+     add_compile_definitions($<$<CONFIG:Debug>:_GLIBCXX_ASSERTIONS>)
+-
+ endif()
+ 
+-
+-
+ if (NOT MSVC)
+-
+     if (GGML_SANITIZE_THREAD)
+-
+         add_compile_options(-fsanitize=thread)
+-
+         link_libraries     (-fsanitize=thread)
+-
+     endif()
+ 
+-
+-
+     if (GGML_SANITIZE_ADDRESS)
+-
+         add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+-
+         link_libraries     (-fsanitize=address)
+-
+     endif()
+ 
+-
+-
+     if (GGML_SANITIZE_UNDEFINED)
+-
+         add_compile_options(-fsanitize=undefined)
+-
+         link_libraries     (-fsanitize=undefined)
+-
+     endif()
+-
+ endif()
+ 
+-
+-
+ if (GGML_FATAL_WARNINGS)
+-
+     if (CMAKE_CXX_COMPILER_ID MATCHES "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+-
+         list(APPEND C_FLAGS   -Werror)
+-
+         list(APPEND CXX_FLAGS -Werror)
+-
+     elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+-
+         add_compile_options(/WX)
+-
+     endif()
+-
+ endif()
+ 
+-
+-
+ if (GGML_ALL_WARNINGS)
+-
+     if (NOT MSVC)
+-
+         list(APPEND WARNING_FLAGS -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function)
+-
+         list(APPEND C_FLAGS       -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes
+-
+                                   -Werror=implicit-int -Werror=implicit-function-declaration)
+-
+         list(APPEND CXX_FLAGS     -Wmissing-declarations -Wmissing-noreturn)
+ 
+-
+-
+         list(APPEND C_FLAGS   ${WARNING_FLAGS})
+-
+         list(APPEND CXX_FLAGS ${WARNING_FLAGS})
+ 
+-
+-
+         ggml_get_flags(${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION})
+ 
+-
+-
+         add_compile_options("$<$<COMPILE_LANGUAGE:C>:${C_FLAGS};${GF_C_FLAGS}>"
+-
+                             "$<$<COMPILE_LANGUAGE:CXX>:${CXX_FLAGS};${GF_CXX_FLAGS}>")
+-
+     else()
+-
+         # todo : msvc
+-
+         set(C_FLAGS   "")
+-
+         set(CXX_FLAGS "")
+-
+     endif()
+-
+ endif()
+ 
+-
+-
+ if (GGML_LTO)
+-
+     include(CheckIPOSupported)
+-
+     check_ipo_supported(RESULT result OUTPUT output)
+-
+     if (result)
+-
+         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+-
+     else()
+-
+         message(WARNING "IPO is not supported: ${output}")
+-
+     endif()
+-
+ endif()
+ 
+-
+-
+ if (GGML_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+-
+     find_program(GGML_CCACHE_FOUND ccache)
+-
+     find_program(GGML_SCCACHE_FOUND sccache)
+ 
+-
+-
+     if (GGML_CCACHE_FOUND OR GGML_SCCACHE_FOUND)
+-
+         if(GGML_CCACHE_FOUND)
+-
+             set(GGML_CCACHE_VARIANT ccache)
+-
+         else()
+-
+             set(GGML_CCACHE_VARIANT sccache)
+-
+         endif()
+-
+         # TODO: should not be set globally
+-
+         if (GGML_SYCL AND GGML_CCACHE_FOUND AND WIN32)
+-
+             set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "ccache compiler_type=icl")
+-
+         else ()
+-
+             set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${GGML_CCACHE_VARIANT}")
+-
+         endif ()
+-
+         set(ENV{CCACHE_SLOPPINESS} time_macros)
+-
+         message(STATUS "${GGML_CCACHE_VARIANT} found, compilation results will be cached. Disable with GGML_CCACHE=OFF.")
+-
+     else()
+-
+         message(STATUS "Warning: ccache not found - consider installing it for faster compilation or disable this warning with GGML_CCACHE=OFF")
+-
+     endif ()
+-
+ endif()
+ 
+-
+-
+ # this version of Apple ld64 is buggy
+-
+ execute_process(
+-
+     COMMAND ${CMAKE_C_COMPILER} ${CMAKE_EXE_LINKER_FLAGS} -Wl,-v
+-
+     ERROR_VARIABLE output
+-
+     OUTPUT_QUIET
+-
+ )
+ 
+-
+-
+ if (output MATCHES "dyld-1015\.7")
+-
+     add_compile_definitions(HAVE_BUGGY_APPLE_LINKER)
+-
+ endif()
+ 
+-
+-
+ # architecture specific
+-
+ # TODO: probably these flags need to be tweaked on some architectures
+-
+ #       feel free to update the Makefile for your architecture and send a pull request or issue
+-
+ message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
+-
+ if (MSVC)
+-
+     string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" CMAKE_GENERATOR_PLATFORM_LWR)
+-
+     message(STATUS "CMAKE_GENERATOR_PLATFORM: ${CMAKE_GENERATOR_PLATFORM}")
+-
+ else ()
+-
+     set(CMAKE_GENERATOR_PLATFORM_LWR "")
+-
+ endif ()
+-
+ ggml_get_system_arch()
+-
+ message(STATUS "GGML_SYSTEM_ARCH: ${GGML_SYSTEM_ARCH}")
+ 
+-
+-
+ if (NOT MSVC)
+-
+     if (GGML_STATIC)
+-
+         if (UNIX AND NOT APPLE)
+-
+             set(CMAKE_FIND_LIBRARY_SUFFIXES ".a;.so")
+-
+         endif()
+-
+         add_link_options(-static)
+-
+         if (MINGW)
+-
+             add_link_options(-static-libgcc -static-libstdc++)
+-
+         endif()
+-
+     endif()
+-
+     if (GGML_GPROF)
+-
+         add_compile_options(-pg)
+-
+     endif()
+-
+ endif()
+ 
+-
+-
+ #
+-
+ # POSIX conformance
+-
+ #
+ 
+-
+-
+ # clock_gettime came in POSIX.1b (1993)
+-
+ # CLOCK_MONOTONIC came in POSIX.1-2001 / SUSv3 as optional
+-
+ # posix_memalign came in POSIX.1-2001 / SUSv3
+-
+ # M_PI is an XSI extension since POSIX.1-2001 / SUSv3, came in XPG1 (1985)
+ 
+-
+-
+ # Somehow in OpenBSD whenever POSIX conformance is specified
+-
+ # some string functions rely on locale_t availability,
+-
+ # which was introduced in POSIX.1-2008, forcing us to go higher
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "OpenBSD")
+-
+     add_compile_definitions(_XOPEN_SOURCE=700)
+-
+ elseif (CMAKE_SYSTEM_NAME MATCHES "AIX")
+-
+     # Don't define _XOPEN_SOURCE.  We need _ALL_SOURCE, which is the default,
+-
+     # in order to define _SC_PHYS_PAGES.
+-
+ else()
+-
+     add_compile_definitions(_XOPEN_SOURCE=600)
+-
+ endif()
+ 
+-
+-
+ # Data types, macros and functions related to controlling CPU affinity and
+-
+ # some memory allocation are available on Linux through GNU extensions in libc
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux" OR CMAKE_SYSTEM_NAME MATCHES "Android")
+-
+     add_compile_definitions(_GNU_SOURCE)
+-
+ endif()
+ 
+-
+-
+ # RLIMIT_MEMLOCK came in BSD, is not specified in POSIX.1,
+-
+ # and on macOS its availability depends on enabling Darwin extensions
+-
+ # similarly on DragonFly, enabling BSD extensions is necessary
+-
+ if (
+-
+     CMAKE_SYSTEM_NAME MATCHES "Darwin" OR
+-
+     CMAKE_SYSTEM_NAME MATCHES "iOS"    OR
+-
+     CMAKE_SYSTEM_NAME MATCHES "tvOS"   OR
+-
+     CMAKE_SYSTEM_NAME MATCHES "DragonFly"
+-
+ )
+-
+     add_compile_definitions(_DARWIN_C_SOURCE)
+-
+ endif()
+ 
+-
+-
+ # alloca is a non-standard interface that is not visible on BSDs when
+-
+ # POSIX conformance is specified, but not all of them provide a clean way
+-
+ # to enable it in such cases
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
+-
+     add_compile_definitions(__BSD_VISIBLE)
+-
+ endif()
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "NetBSD")
+-
+     add_compile_definitions(_NETBSD_SOURCE)
+-
+ endif()
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "OpenBSD")
+-
+     add_compile_definitions(_BSD_SOURCE)
+-
+ endif()
+ 
+-
+-
+ if (WIN32)
+-
+     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+-
+ endif()
+ 
+-
+-
+ # ggml
+ 
+-
+-
+ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
+-
+     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
+-
+ endif()
+ 
+-
+-
+ add_library(ggml-base
+-
+             ../include/ggml.h
+-
+             ../include/ggml-alloc.h
+-
+             ../include/ggml-backend.h
+-
+             ../include/ggml-cpp.h
+-
+             ../include/ggml-opt.h
+-
+             ../include/gguf.h
+-
+             ggml.c
+-
+             ggml.cpp
+-
+             ggml-alloc.c
+-
+             ggml-backend.cpp
+-
+             ggml-backend-meta.cpp
+-
+             ggml-opt.cpp
+-
+             ggml-threading.cpp
+-
+             ggml-threading.h
+-
+             ggml-turbo-quant.c
+-            ggml-quants.c
+ 
++            ggml-quants.c
+             ggml-quants.h
+-
+             gguf.cpp)
+ 
+-
+-
+ set_target_properties(ggml-base PROPERTIES
+-
+     VERSION ${GGML_VERSION}
+-
+     SOVERSION ${GGML_VERSION_MAJOR}
+-
+ )
+ 
+-
+-
+ target_include_directories(ggml-base PRIVATE .)
+-
+ if (GGML_BACKEND_DL)
+-
+     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
+-
+ endif()
+ 
+-
+-
+ if (GGML_SCHED_NO_REALLOC)
+-
+     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
+-
+ endif()
+ 
+-
+-
+ if (GGML_OPENMP_FETCH)
+-
+     if (NOT GGML_OPENMP)
+-
+         message(FATAL_ERROR "GGML_OPENMP_FETCH requires GGML_OPENMP")
+-
+     elseif (NOT WIN32 OR NOT (CMAKE_C_COMPILER_ID MATCHES "Clang"))
+-
+         message(FATAL_ERROR "GGML_OPENMP_FETCH currently requires Clang on Windows")
+-
+     endif()
+ 
+-
+-
+     set(GGML_OPENMP_LLVM_VERSION "20.1.8")
+-
+     string(REGEX MATCH "^[0-9]+" GGML_OPENMP_LLVM_VERSION_MAJOR "${GGML_OPENMP_LLVM_VERSION}")
+-
+     string(REGEX MATCH "^[0-9]+" GGML_OPENMP_COMPILER_VERSION_MAJOR "${CMAKE_C_COMPILER_VERSION}")
+-
+     if (NOT GGML_OPENMP_COMPILER_VERSION_MAJOR STREQUAL GGML_OPENMP_LLVM_VERSION_MAJOR)
+-
+         message(FATAL_ERROR "LLVM OpenMP ${GGML_OPENMP_LLVM_VERSION} requires Clang ${GGML_OPENMP_LLVM_VERSION_MAJOR}.x")
+-
+     endif()
+ 
+-
+-
+     string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" GGML_OPENMP_SYSTEM_PROCESSOR)
+-
+     if (GGML_OPENMP_SYSTEM_PROCESSOR MATCHES "^(amd64|x86_64)$")
+-
+         set(GGML_OPENMP_ARCH "x64")
+-
+         set(GGML_OPENMP_INSTALLER_SUFFIX "win64")
+-
+         set(GGML_OPENMP_INSTALLER_SHA256 "3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b")
+-
+     elseif (GGML_OPENMP_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+-
+         set(GGML_OPENMP_ARCH "arm64")
+-
+         set(GGML_OPENMP_INSTALLER_SUFFIX "woa64")
+-
+         set(GGML_OPENMP_INSTALLER_SHA256 "7c4ac97eb2ae6b960ca5f9caf3ff6124c8d2a18cc07a7840a4d2ea15537bad8e")
+-
+     else()
+-
+         message(FATAL_ERROR "GGML_OPENMP_FETCH does not support ${CMAKE_SYSTEM_PROCESSOR}")
+-
+     endif()
+ 
+-
+-
+     set(GGML_OPENMP_CACHE_DIR "${CMAKE_BINARY_DIR}/_deps")
+-
+     set(GGML_OPENMP_ROOT "${GGML_OPENMP_CACHE_DIR}/llvm-openmp-${GGML_OPENMP_LLVM_VERSION}-${GGML_OPENMP_ARCH}")
+-
+     set(GGML_OPENMP_LIBRARY "${GGML_OPENMP_ROOT}/lib/libomp.lib")
+-
+     set(GGML_OPENMP_RUNTIME "${GGML_OPENMP_ROOT}/bin/libomp.dll")
+-
+     set(GGML_OPENMP_HEADER "${GGML_OPENMP_ROOT}/include/omp.h")
+-
+     set(GGML_OPENMP_LICENSE "${GGML_OPENMP_ROOT}/LICENSE.TXT")
+-
+     set(GGML_OPENMP_LICENSE_SHA256 "fdad1758a9e1f9d5a81e18879b3406772115edc92c24bfa36b70c654f325e8e4")
+ 
+-
+-
+     if (NOT EXISTS "${GGML_OPENMP_LIBRARY}" OR NOT EXISTS "${GGML_OPENMP_RUNTIME}" OR NOT EXISTS "${GGML_OPENMP_HEADER}")
+-
+         find_program(GGML_OPENMP_7Z NAMES 7z 7zz 7za)
+-
+         if (NOT GGML_OPENMP_7Z)
+-
+             message(FATAL_ERROR "GGML_OPENMP_FETCH requires 7-Zip to extract the LLVM installer")
+-
+         endif()
+ 
+-
+-
+         set(GGML_OPENMP_INSTALLER "${GGML_OPENMP_ROOT}/LLVM-${GGML_OPENMP_LLVM_VERSION}-${GGML_OPENMP_INSTALLER_SUFFIX}.exe")
+-
+         set(GGML_OPENMP_EXTRACT_DIR "${GGML_OPENMP_ROOT}/extract")
+-
+         set(GGML_OPENMP_INSTALLER_URL "https://github.com/llvm/llvm-project/releases/download/llvmorg-${GGML_OPENMP_LLVM_VERSION}/LLVM-${GGML_OPENMP_LLVM_VERSION}-${GGML_OPENMP_INSTALLER_SUFFIX}.exe")
+ 
+-
+-
+         file(MAKE_DIRECTORY "${GGML_OPENMP_EXTRACT_DIR}")
+-
+         file(DOWNLOAD "${GGML_OPENMP_INSTALLER_URL}" "${GGML_OPENMP_INSTALLER}"
+-
+             EXPECTED_HASH "SHA256=${GGML_OPENMP_INSTALLER_SHA256}"
+-
+             SHOW_PROGRESS
+-
+             STATUS GGML_OPENMP_DOWNLOAD_STATUS)
+-
+         list(GET GGML_OPENMP_DOWNLOAD_STATUS 0 GGML_OPENMP_DOWNLOAD_RESULT)
+-
+         if (NOT GGML_OPENMP_DOWNLOAD_RESULT EQUAL 0)
+-
+             list(GET GGML_OPENMP_DOWNLOAD_STATUS 1 GGML_OPENMP_DOWNLOAD_ERROR)
+-
+             message(FATAL_ERROR "Failed to download LLVM OpenMP: ${GGML_OPENMP_DOWNLOAD_ERROR}")
+-
+         endif()
+ 
+-
+-
+         execute_process(
+-
+             COMMAND "${GGML_OPENMP_7Z}" e -y "-o${GGML_OPENMP_EXTRACT_DIR}" "${GGML_OPENMP_INSTALLER}" -r libomp.lib libomp.dll omp.h
+-
+             RESULT_VARIABLE GGML_OPENMP_EXTRACT_RESULT
+-
+             OUTPUT_QUIET)
+-
+         if (NOT GGML_OPENMP_EXTRACT_RESULT EQUAL 0 OR
+-
+             NOT EXISTS "${GGML_OPENMP_EXTRACT_DIR}/libomp.lib" OR
+-
+             NOT EXISTS "${GGML_OPENMP_EXTRACT_DIR}/libomp.dll" OR
+-
+             NOT EXISTS "${GGML_OPENMP_EXTRACT_DIR}/omp.h")
+-
+             message(FATAL_ERROR "Failed to extract libomp from ${GGML_OPENMP_INSTALLER}")
+-
+         endif()
+ 
+-
+-
+         file(MAKE_DIRECTORY "${GGML_OPENMP_ROOT}/lib" "${GGML_OPENMP_ROOT}/bin" "${GGML_OPENMP_ROOT}/include")
+-
+         file(COPY "${GGML_OPENMP_EXTRACT_DIR}/libomp.lib" DESTINATION "${GGML_OPENMP_ROOT}/lib")
+-
+         file(COPY "${GGML_OPENMP_EXTRACT_DIR}/libomp.dll" DESTINATION "${GGML_OPENMP_ROOT}/bin")
+-
+         file(COPY "${GGML_OPENMP_EXTRACT_DIR}/omp.h" DESTINATION "${GGML_OPENMP_ROOT}/include")
+-
+         file(REMOVE_RECURSE "${GGML_OPENMP_INSTALLER}" "${GGML_OPENMP_EXTRACT_DIR}")
+-
+     endif()
+ 
+-
+-
+     # The NSIS installer embeds LLVM's general license in its UI but does not install it as a file; use OpenMP's license to include its additional notices.
+-
+     if (EXISTS "${GGML_OPENMP_LICENSE}")
+-
+         file(SHA256 "${GGML_OPENMP_LICENSE}" GGML_OPENMP_LICENSE_ACTUAL_SHA256)
+-
+     endif()
+-
+     if (NOT GGML_OPENMP_LICENSE_ACTUAL_SHA256 STREQUAL GGML_OPENMP_LICENSE_SHA256)
+-
+         file(DOWNLOAD "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-${GGML_OPENMP_LLVM_VERSION}/openmp/LICENSE.TXT" "${GGML_OPENMP_LICENSE}"
+-
+             EXPECTED_HASH "SHA256=${GGML_OPENMP_LICENSE_SHA256}")
+-
+     endif()
+ 
+-
+-
+     if (COMMAND license_add_file)
+-
+         license_add_file("LLVM OpenMP" "${GGML_OPENMP_LICENSE}")
+-
+     endif()
+ 
+-
+-
+     add_library(ggml-openmp-c INTERFACE)
+-
+     target_compile_options(ggml-openmp-c INTERFACE "$<$<COMPILE_LANGUAGE:C>:-fopenmp=libomp>")
+-
+     target_include_directories(ggml-openmp-c SYSTEM INTERFACE "${GGML_OPENMP_ROOT}/include")
+-
+     target_link_libraries(ggml-openmp-c INTERFACE "${GGML_OPENMP_LIBRARY}")
+ 
+-
+-
+     add_library(ggml-openmp-cxx INTERFACE)
+-
+     target_compile_options(ggml-openmp-cxx INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:-fopenmp=libomp>")
+-
+     target_include_directories(ggml-openmp-cxx SYSTEM INTERFACE "${GGML_OPENMP_ROOT}/include")
+-
+     target_link_libraries(ggml-openmp-cxx INTERFACE "${GGML_OPENMP_LIBRARY}")
+ 
+-
+-
+     set(GGML_OPENMP_RUNTIME_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+-
+     if (CMAKE_CONFIGURATION_TYPES)
+-
+         string(APPEND GGML_OPENMP_RUNTIME_OUTPUT_DIR "/$<CONFIG>")
+-
+     endif()
+-
+     add_custom_target(ggml-openmp-runtime ALL
+-
+         COMMAND ${CMAKE_COMMAND} -E make_directory "${GGML_OPENMP_RUNTIME_OUTPUT_DIR}"
+-
+         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GGML_OPENMP_RUNTIME}" "${GGML_OPENMP_RUNTIME_OUTPUT_DIR}/libomp.dll"
+-
+         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GGML_OPENMP_LICENSE}" "${GGML_OPENMP_RUNTIME_OUTPUT_DIR}/LICENSE-LLVM-OpenMP")
+-
+     add_dependencies(ggml-base ggml-openmp-runtime)
+-
+     install(FILES "${GGML_OPENMP_RUNTIME}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+-
+     install(FILES "${GGML_OPENMP_LICENSE}" DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME LICENSE-LLVM-OpenMP)
+ 
+-
+-
+     set(GGML_OPENMP_TARGET_C ggml-openmp-c)
+-
+     set(GGML_OPENMP_TARGET_CXX ggml-openmp-cxx)
+-
+     set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+-
+ elseif (GGML_OPENMP)
+-
+     find_package(OpenMP)
+-
+     if (OpenMP_FOUND)
+-
+         set(GGML_OPENMP_TARGET_C OpenMP::OpenMP_C)
+-
+         set(GGML_OPENMP_TARGET_CXX OpenMP::OpenMP_CXX)
+-
+         set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+-
+     else()
+-
+         set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
+-
+         message(WARNING "OpenMP not found")
+-
+     endif()
+-
+ else()
+-
+     set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
+-
+ endif()
+ 
+-
+-
+ if (GGML_OPENMP_ENABLED)
+-
+     target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
+-
+     target_link_libraries(ggml-base PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
+-
+ endif()
+ 
+-
+-
+ add_library(ggml
+-
+             ggml-backend-dl.cpp
+-
+             ggml-backend-reg.cpp)
+-
+ add_library(ggml::ggml ALIAS ggml)
+ 
+-
+-
+ set_target_properties(ggml PROPERTIES
+-
+     VERSION ${GGML_VERSION}
+-
+     SOVERSION ${GGML_VERSION_MAJOR}
+-
+ )
+ 
+-
+-
+ if (GGML_BACKEND_DIR)
+-
+     if (NOT GGML_BACKEND_DL)
+-
+         message(FATAL_ERROR "GGML_BACKEND_DIR requires GGML_BACKEND_DL")
+-
+     endif()
+-
+     target_compile_definitions(ggml PUBLIC GGML_BACKEND_DIR="${GGML_BACKEND_DIR}")
+-
+ endif()
+ 
+-
+-
+ target_link_libraries(ggml PUBLIC ggml-base)
+ 
+-
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+-
+     target_link_libraries(ggml PRIVATE dl)
+-
+ endif()
+ 
+-
+-
+ function(ggml_add_backend_library backend)
+-
+     if (GGML_BACKEND_DL)
+-
+         add_library(${backend} MODULE ${ARGN})
+-
+         # write the shared library to the output directory
+-
+         set_target_properties(${backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+-
+         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_DL)
+-
+         add_dependencies(ggml ${backend})
+-
+         if (GGML_BACKEND_DIR)
+-
+             install(TARGETS ${backend} LIBRARY DESTINATION ${GGML_BACKEND_DIR})
+-
+         else()
+-
+             install(TARGETS ${backend} LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR})
+-
+         endif()
+-
+     else()
+-
+         add_library(${backend} ${ARGN})
+-
+         target_link_libraries(ggml PUBLIC ${backend})
+-
+         install(TARGETS ${backend} LIBRARY)
+-
+     endif()
+ 
+-
+-
+     target_link_libraries(${backend} PRIVATE ggml-base)
+-
+     target_include_directories(${backend} PRIVATE ..)
+ 
+-
+-
+     if (${BUILD_SHARED_LIBS})
+-
+         target_compile_definitions(${backend} PRIVATE GGML_BACKEND_BUILD)
+-
+         target_compile_definitions(${backend} PUBLIC  GGML_BACKEND_SHARED)
+-
+     endif()
+ 
+-
+-
+     # Set versioning properties for all backend libraries
+-
+     # Building a MODULE library with a version is not supported on macOS (https://gitlab.kitware.com/cmake/cmake/-/issues/20782)
+-
+     if (NOT (APPLE AND GGML_BACKEND_DL))
+-
+         set_target_properties(${backend} PROPERTIES
+-
+             VERSION ${GGML_VERSION}
+-
+             SOVERSION ${GGML_VERSION_MAJOR}
+-
+         )
+-
+     endif()
+ 
+-
+-
+     if(NOT GGML_AVAILABLE_BACKENDS)
+-
+         set(GGML_AVAILABLE_BACKENDS "${backend}"
+-
+             CACHE INTERNAL "List of backends for cmake package")
+-
+     else()
+-
+         list(FIND GGML_AVAILABLE_BACKENDS "${backend}" has_backend)
+-
+         if(has_backend EQUAL -1)
+-
+             set(GGML_AVAILABLE_BACKENDS "${GGML_AVAILABLE_BACKENDS};${backend}"
+-
+                 CACHE INTERNAL "List of backends for cmake package")
+-
+         endif()
+-
+     endif()
+-
+ endfunction()
+ 
+-
+-
+ function(ggml_add_backend backend)
+-
+     string(TOUPPER "GGML_${backend}" backend_id)
+-
+     if (${backend_id})
+-
+         string(TOLOWER "ggml-${backend}" backend_target)
+-
+         add_subdirectory(${backend_target})
+-
+         message(STATUS "Including ${backend} backend")
+-
+         if (NOT GGML_BACKEND_DL)
+-
+             string(TOUPPER "GGML_USE_${backend}" backend_use)
+-
+             target_compile_definitions(ggml PUBLIC ${backend_use})
+-
+         endif()
+-
+     endif()
+-
+ endfunction()
+ 
+-
+-
+ function(ggml_add_cpu_backend_variant tag_name)
+-
+     set(GGML_CPU_TAG_NAME ${tag_name})
+-
+     # other: OPENMP LLAMAFILE CPU_HBM
+-
+     if (GGML_SYSTEM_ARCH STREQUAL "x86")
+-
+         foreach (feat NATIVE
+-
+                       SSE42
+-
+                       AVX AVX2 BMI2 AVX_VNNI FMA F16C
+-
+                       AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16
+-
+                       AMX_TILE AMX_INT8 AMX_BF16)
+-
+             set(GGML_${feat} OFF)
+-
+         endforeach()
+ 
+-
+-
+         foreach (feat ${ARGN})
+-
+             set(GGML_${feat} ON)
+-
+         endforeach()
+-
+     elseif (GGML_SYSTEM_ARCH STREQUAL "ARM")
+-
+         foreach (feat ${ARGN})
+-
+             set(GGML_INTERNAL_${feat} ON)
+-
+         endforeach()
+-
+     elseif (GGML_SYSTEM_ARCH STREQUAL "PowerPC")
+-
+         foreach (feat ${ARGN})
+-
+             set(GGML_INTERNAL_${feat} ON)
+-
+         endforeach()
+-
+     elseif (GGML_SYSTEM_ARCH STREQUAL "s390x")
+-
+         foreach (feat VXE2 NNPA)
+-
+             set(GGML_INTERNAL_${feat} OFF)
+-
+         endforeach()
+ 
+-
+-
+         foreach (feat ${ARGN})
+-
+             set(GGML_INTERNAL_${feat} ON)
+-
+         endforeach()
+-
+     elseif (GGML_SYSTEM_ARCH STREQUAL "riscv64")
+-
+         foreach (feat RVV)
+-
+             set(GGML_INTERNAL_${feat} OFF)
+-
+         endforeach()
+ 
+-
+-
+         foreach (feat ${ARGN})
+-
+             set(GGML_INTERNAL_${feat} ON)
+-
+         endforeach()
+-
+     endif()
+ 
+-
+-
+     ggml_add_cpu_backend_variant_impl(${tag_name})
+-
+ endfunction()
+ 
+-
+-
+ ggml_add_backend(CPU)
+ 
+-
+-
+ if (GGML_CPU_ALL_VARIANTS)
+-
+     if (NOT GGML_BACKEND_DL)
+-
+         message(FATAL_ERROR "GGML_CPU_ALL_VARIANTS requires GGML_BACKEND_DL")
+-
+     elseif (GGML_CPU_ARM_ARCH)
+-
+         message(FATAL_ERROR "Cannot use both GGML_CPU_ARM_ARCH and GGML_CPU_ALL_VARIANTS")
+-
+     endif()
+-
+     if (GGML_SYSTEM_ARCH STREQUAL "x86")
+-
+         ggml_add_cpu_backend_variant(x64)
+-
+         ggml_add_cpu_backend_variant(sse42              SSE42)
+-
+         ggml_add_cpu_backend_variant(sandybridge        SSE42 AVX)
+-
+         if (NOT MSVC)
+-
+             # __FMA__ and __F16C__ are not defined in MSVC, however they are implied with AVX2/AVX512
+-
+             ggml_add_cpu_backend_variant(ivybridge      SSE42 AVX F16C)
+-
+             ggml_add_cpu_backend_variant(piledriver     SSE42 AVX F16C FMA)
+-
+         endif()
+-
+         ggml_add_cpu_backend_variant(haswell            SSE42 AVX F16C FMA AVX2 BMI2)
+-
+         ggml_add_cpu_backend_variant(skylakex           SSE42 AVX F16C FMA AVX2 BMI2 AVX512)
+-
+         ggml_add_cpu_backend_variant(cannonlake         SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI)
+-
+         ggml_add_cpu_backend_variant(cascadelake        SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VNNI)
+-
+         ggml_add_cpu_backend_variant(icelake            SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI)
+-
+         if (NOT MSVC)
+-
+             # MSVC 2022 doesn't support BF16 intrinsics without `/arch:AVX10.1` ?!
+-
+             # https://learn.microsoft.com/en-us/cpp/intrinsics/x64-amd64-intrinsics-list?view=msvc-170
+-
+             # https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64?view=msvc-170
+-
+             ggml_add_cpu_backend_variant(cooperlake     SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VNNI AVX512_BF16)
+-
+             ggml_add_cpu_backend_variant(zen4           SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
+-
+         endif()
+-
+         ggml_add_cpu_backend_variant(alderlake          SSE42 AVX F16C FMA AVX2 BMI2 AVX_VNNI)
+-
+         if (NOT MSVC)
+-
+             # MSVC doesn't support AMX
+-
+             ggml_add_cpu_backend_variant(sapphirerapids SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 AMX_TILE AMX_INT8)
+-
+         endif()
+-
+     elseif(GGML_SYSTEM_ARCH STREQUAL "ARM")
+-
+         if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+-
+             # Many of these features are optional so we build versions with popular
+-
+             # combinations and name the backends based on the version they were
+-
+             # first released with
+-
+             ggml_add_cpu_backend_variant(armv8.0_1)
+-
+             ggml_add_cpu_backend_variant(armv8.2_1    DOTPROD)
+-
+             ggml_add_cpu_backend_variant(armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
+-
+             ggml_add_cpu_backend_variant(armv8.2_3    DOTPROD FP16_VECTOR_ARITHMETIC SVE)
+-
+             ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8)
+-
+             ggml_add_cpu_backend_variant(armv8.6_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2)
+-
+             ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
+-
+             ggml_add_cpu_backend_variant(armv9.2_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2 SME)
+-
+         elseif (CMAKE_SYSTEM_NAME MATCHES "Android")
+-
+             # Android-specific backends with SoC-compatible feature sets
+-
+             ggml_add_cpu_backend_variant(android_armv8.0_1)
+-
+             ggml_add_cpu_backend_variant(android_armv8.2_1    DOTPROD)
+-
+             ggml_add_cpu_backend_variant(android_armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
+-
+             ggml_add_cpu_backend_variant(android_armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8)
+-
+             ggml_add_cpu_backend_variant(android_armv9.0_1    DOTPROD MATMUL_INT8 FP16_VECTOR_ARITHMETIC SVE2)
+-
+             ggml_add_cpu_backend_variant(android_armv9.2_1    DOTPROD MATMUL_INT8 FP16_VECTOR_ARITHMETIC SVE SME)
+-
+             ggml_add_cpu_backend_variant(android_armv9.2_2    DOTPROD MATMUL_INT8 FP16_VECTOR_ARITHMETIC SVE SVE2 SME)
+-
+         elseif (APPLE)
+-
+             ggml_add_cpu_backend_variant(apple_m1             DOTPROD)
+-
+             ggml_add_cpu_backend_variant(apple_m2_m3          DOTPROD MATMUL_INT8)
+-
+             ggml_add_cpu_backend_variant(apple_m4             DOTPROD MATMUL_INT8 NOSVE SME)
+-
+         else()
+-
+             message(FATAL_ERROR "Unsupported ARM target OS: ${CMAKE_SYSTEM_NAME}")
+-
+         endif()
+-
+     elseif (GGML_SYSTEM_ARCH STREQUAL "PowerPC")
+-
+         if (CMAKE_SYSTEM_NAME MATCHES "Linux|AIX")
+-
+             ggml_add_cpu_backend_variant(power0)
+-
+             ggml_add_cpu_backend_variant(power7_1       POWER7)
+-
+             ggml_add_cpu_backend_variant(power7_2       POWER7  VSX)
+-
+             ggml_add_cpu_backend_variant(power8_1       POWER8)
+-
+             ggml_add_cpu_backend_variant(power8_2       POWER8  VSX)
+-
+             ggml_add_cpu_backend_variant(power9         POWER9  VSX)
+-
+             ggml_add_cpu_backend_variant(power10        POWER10 VSX)
+-
+             # POWER11 backend: only if compiler supports -mcpu=power11
+-
+             check_cxx_compiler_flag("-mcpu=power11" GGML_CXX_SUPPORTS_POWER11)
+-
+             if (GGML_CXX_SUPPORTS_POWER11)
+-
+                 message(STATUS "Compiler supports -mcpu=power11, enabling POWER11 backend")
+-
+                 ggml_add_cpu_backend_variant(power11 POWER11 VSX)
+-
+             else()
+-
+                 message(STATUS "Skipping POWER11 backend: compiler does not support -mcpu=power11")
+-
+             endif()
+-
+         else()
+-
+             message(FATAL_ERROR "Unsupported PowerPC target OS: ${CMAKE_SYSTEM_NAME}")
+-
+         endif()
+-
+     elseif (GGML_SYSTEM_ARCH STREQUAL "s390x")
+-
+         if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+-
+             ggml_add_cpu_backend_variant(z15    Z15 VXE2)
+-
+             ggml_add_cpu_backend_variant(z16    Z16 VXE2 NNPA)
+-
+         else()
+-
+             message(FATAL_ERROR "Unsupported s390x target OS: ${CMAKE_SYSTEM_NAME}")
+-
+         endif()
+-
+     elseif (GGML_SYSTEM_ARCH STREQUAL "riscv64")
+-
+         if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+-
+             ggml_add_cpu_backend_variant(riscv64_0)
+-
+             ggml_add_cpu_backend_variant(riscv64_v   RVV)
+-
+         else()
+-
+             message(FATAL_ERROR "Unsupported RISC-V target OS: ${CMAKE_SYSTEM_NAME}")
+-
+         endif()
+-
+     else()
+-
+         message(FATAL_ERROR "GGML_CPU_ALL_VARIANTS not yet supported with ${GGML_SYSTEM_ARCH} on ${CMAKE_SYSTEM_NAME}")
+-
+     endif()
+-
+ elseif (GGML_CPU)
+-
+     ggml_add_cpu_backend_variant_impl("")
+-
+ endif()
+ 
+-
+-
+ ggml_add_backend(BLAS)
+-
+ ggml_add_backend(CANN)
+-
+ ggml_add_backend(CUDA)
+-
+ ggml_add_backend(ET)
+-
+ ggml_add_backend(HIP)
+-
+ ggml_add_backend(METAL)
+-
+ ggml_add_backend(MUSA)
+-
+ ggml_add_backend(RPC)
+-
+ ggml_add_backend(VirtGPU)
+-
+ ggml_add_backend(SYCL)
+-
+ ggml_add_backend(Vulkan)
+-
+ ggml_add_backend(WebGPU)
+-
+ ggml_add_backend(zDNN)
+-
+ ggml_add_backend(OpenCL)
+-
+ ggml_add_backend(Hexagon)
+-
+ ggml_add_backend(ZenDNN)
+-
+ ggml_add_backend(OPENVINO)
+ 
+-
+-
+ foreach (target ggml-base ggml)
+-
+     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
+-
+     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
+-
+ endforeach()
+ 
+-
+-
+ target_link_libraries(ggml-base PRIVATE Threads::Threads)
+ 
+-
+-
+ if (DEFINED MATH_LIBRARY)
+-
+     target_link_libraries(ggml-base PRIVATE ${MATH_LIBRARY})
+-
+ elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
+-
+     target_link_libraries(ggml-base PRIVATE m)
+-
+ endif()
+ 
+-
+-
+ if (CMAKE_SYSTEM_NAME MATCHES "Android")
+-
+     target_link_libraries(ggml-base PRIVATE dl)
+-
+ endif()
+ 
+-
+-
+ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
+-
+     target_compile_definitions(ggml-base PUBLIC _DARWIN_C_SOURCE)
+-
+ endif()
+ 
+-
+-
+ if (BUILD_SHARED_LIBS)
+-
+     foreach (target ggml-base ggml)
+-
+         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+-
+         target_compile_definitions(${target} PRIVATE GGML_BUILD)
+-
+         target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+-
+     endforeach()
+-
+ endif()
+-
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index c35498c..2ddf637 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -1,227 +1,115 @@
+ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
+ 
+-
+-
+ find_package(CUDAToolkit)
+ 
+-
+-
+ if (CUDAToolkit_FOUND)
+-
+     message(STATUS "CUDA Toolkit found")
+ 
+-
+-
+     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+-
+         # native == GPUs available at build time
+-
+         # 50     == Maxwell, lowest CUDA 12 standard
+-
+         # 60     == P100, FP16 CUDA intrinsics
+-
+         # 61     == Pascal, __dp4a instruction (per-byte integer dot product)
+-
+         # 70     == V100, FP16 tensor cores
+-
+         # 75     == Turing, int8 tensor cores
+-
+         # 80     == Ampere, asynchronous data loading, faster tensor core instructions
+-
+         # 86     == RTX 3000, needs CUDA v11.1
+-
+         # 89     == RTX 4000, needs CUDA v11.8
+-
+         # 90     == Hopper H100/200, needs CUDA v11.8
+-
+         # 120    == Blackwell, needs CUDA v12.8, FP4 tensor cores
+-
+         #
+-
+         # XX-virtual == compile CUDA code as PTX, do JIT compilation to binary code on first run
+-
+         # XX-real    == compile CUDA code as device code for this specific architecture
+-
+         # no suffix  == compile as both PTX and device code
+-
+         #
+-
+         # The default behavior for a non-native is to build virtual architectures as needed to cover all features needed
+-
+         #     for best performance and to also build real architectures for the most commonly used GPUs.
+-
+         if (GGML_NATIVE AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.6" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+-
+             set(CMAKE_CUDA_ARCHITECTURES "native")
+-
+         else()
+-
+             if (CUDAToolkit_VERSION VERSION_LESS "13")
+-
+                 list(APPEND CMAKE_CUDA_ARCHITECTURES 50-virtual 61-virtual 70-virtual)
+-
+             endif ()
+ 
+-
+-
+             list(APPEND CMAKE_CUDA_ARCHITECTURES 75-virtual 80-virtual 86-real)
+ 
+-
+-
+             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
+-
+                 list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real 90-virtual)
+-
+             endif()
+ 
+-
+-
+             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+-
+                 # The CUDA architecture 120f-virtual would in principle work for Blackwell support
+-
+                 #     but the newly added "f" suffix conflicted with a preexising regex for validating CUDA architectures in CMake.
+-
+                 # So either a recent CMake version or one with the backported fix is needed.
+-
+                 # The following versions should work:
+-
+                 #   - CMake >= v3.31.8 && CMake < v4.0.0
+-
+                 #   - CMake >= v4.0.2
+-
+                 # This is NOT documented in the CMake release notes,
+-
+                 #     check Modules/Internal/CMakeCUDAArchitecturesValidate.cmake in the CMake git repository instead.
+-
+                 # However, the architectures 120a-real and 121a-real should work with basically any CMake version and
+-
+                 #     until the release of e.g. Rubin there is no benefit to shipping virtual architectures for Blackwell.
+-
+                 list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real)
+-
+             endif()
+-
+             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.9")
+-
+                 list(APPEND CMAKE_CUDA_ARCHITECTURES 121a-real)
+-
+             endif()
+-
+         endif()
+-
+     endif()
+ 
+-
+-
+     enable_language(CUDA)
+ 
+-
+-
+     # TODO: Remove once CCCL 3.2 has been released and bundled with CUDA Toolkit
+-
+     if (GGML_CUDA_CUB_3DOT2)
+-
+         include(FetchContent)
+ 
+-
+-
+         FetchContent_Declare(
+-
+             CCCL
+-
+             GIT_REPOSITORY https://github.com/nvidia/cccl.git
+-
+             GIT_TAG        v3.2.0
+-
+             GIT_SHALLOW    TRUE
+-
+         )
+ 
+-
+-
+         FetchContent_MakeAvailable(CCCL)
+-
+     endif()
+ 
+-
+-
+     # Replace any plain 12X CUDA architectures with their "architecture-specific" equivalents 12Xa.
+-
+     # 12X is forwards-compatible, 12Xa is not.
+-
+     # Notably the Blackwell FP4 tensor core instructions are not forwards compatible and therefore need 12Xa.
+-
+     # But while 12X vs. 12Xa can be checked in device code there is (to my knowledge) no easy way to do the same check in host code.
+-
+     # So for now just replace all instances of 12X with 12Xa, this should be fine until Rubin is released.
+-
+     foreach(ARCHS IN ITEMS CMAKE_CUDA_ARCHITECTURES CMAKE_CUDA_ARCHITECTURES_NATIVE)
+-
+         set(FIXED_ARCHS "")
+-
+         foreach(ARCH IN LISTS ${ARCHS})
+-
+             if (ARCH MATCHES "^12[0-9](-real|-virtual)?$")
+-
+                 string(REGEX REPLACE "^(12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
+-
+                 message(STATUS "Replacing ${ARCH} in ${ARCHS} with ${FIXED_ARCH}")
+-
+                 list(APPEND FIXED_ARCHS "${FIXED_ARCH}")
+-
+             else()
+-
+                 list(APPEND FIXED_ARCHS "${ARCH}")
+-
+             endif()
+-
+         endforeach()
+-
+         set(${ARCHS} ${FIXED_ARCHS})
+-
+     endforeach()
+ 
+-
+-
+     # If we try to compile a "native" build it will use the 12X architectures and fail.
+-
+     # So we should instead use the native architectures as determined by CMake after replacing 12X with 12Xa.
+-
+     # But if at the time of the build no GPUs are connected at all CMAKE_CUDA_ARCHITECTURES will contain garbage that we should not use.
+-
+     if (CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "^[0-9]+(a|f)?(-real|-virtual)?(;[0-9]+(a|f)?(-real|-virtual)?|;)*$")
+-
+         set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+-
+     endif()
+-
+     message(STATUS "Using CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} CMAKE_CUDA_ARCHITECTURES_NATIVE=${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+ 
+-
+-
+     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
+-
+     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+ 
+-
+-
+     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+-
+     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
+-
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+-
+     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+-
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+-
+     file(GLOB   SRCS "template-instances/mmq*.cu")
+-
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+-
+     file(GLOB   SRCS "template-instances/mmf*.cu")
+-
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+ 
+     if (GGML_CUDA_FA_ALL_QUANTS)
+@@ -243,339 +131,172 @@ if (CUDAToolkit_FOUND)
+             template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+             template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu)
+     endif()
+-
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+-    if (GGML_CUDA_FA_ALL_QUANTS)
+ 
++    if (GGML_CUDA_FA_ALL_QUANTS)
+         file(GLOB   SRCS "template-instances/fattn-vec*.cu")
+-
+         list(APPEND GGML_SOURCES_CUDA ${SRCS})
+-
+         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+-
+     else()
+-
+         list(APPEND GGML_SOURCES_CUDA
+-
+             template-instances/fattn-vec-instance-f16-f16.cu
+-
+             template-instances/fattn-vec-instance-q4_0-q4_0.cu
+-
+             template-instances/fattn-vec-instance-q8_0-q8_0.cu
+-
+             template-instances/fattn-vec-instance-bf16-bf16.cu)
+-
+     endif()
+ 
+-
+-
+     ggml_add_backend_library(ggml-cuda
+-
+                              ${GGML_HEADERS_CUDA}
+-
+                              ${GGML_SOURCES_CUDA}
+-
+                             )
+ 
+-
+-
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+ 
+-
+-
+     if (GGML_CUDA_GRAPHS)
+-
+         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
+-
+     endif()
+ 
+-
+-
+     if (GGML_CUDA_FORCE_MMQ)
+-
+         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+-
+     endif()
+ 
+-
+-
+     if (GGML_CUDA_HOPPER_Q1)
+-
+         # opt-in Hopper (sm_90a) wgmma path for Q1_0/PQ2_0 prefill; needs CUTLASS headers (CuTe)
+-
+         if (NOT GGML_CUDA_CUTLASS_DIR)
+-
+             message(FATAL_ERROR "GGML_CUDA_HOPPER_Q1 requires GGML_CUDA_CUTLASS_DIR (CUTLASS checkout root)")
+-
+         endif()
+-
+         target_compile_definitions(ggml-cuda PRIVATE GGML_USE_HOPPER_Q1)
+-
+         target_include_directories(ggml-cuda PRIVATE
+-
+             ${GGML_CUDA_CUTLASS_DIR}/include
+-
+             ${GGML_CUDA_CUTLASS_DIR}/tools/util/include)
+-
+         target_compile_options(ggml-cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+-
+     endif()
+ 
+-
+-
+     if (GGML_CUDA_FORCE_CUBLAS)
+-
+         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+-
+     endif()
+ 
+-
+-
+     if (GGML_CUDA_NO_VMM)
+-
+         add_compile_definitions(GGML_CUDA_NO_VMM)
+-
+     endif()
+ 
+-
+-
+     if (NOT GGML_CUDA_FA)
+-
+         add_compile_definitions(GGML_CUDA_NO_FA)
+-
+     endif()
+ 
+-
+-
+     if (GGML_CUDA_NO_PEER_COPY)
+-
+         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
+-
+     endif()
+ 
+-
+-
+     if (GGML_STATIC)
+-
+         if (WIN32)
+-
+             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
+-
+             target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
+-
+         else ()
+-
+             if (GGML_CUDA_CUB_3DOT2)
+-
+                 target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
+-
+             endif()
+-
+             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "10.1")
+-
+                 target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
+-
+             else()
+-
+                 target_link_libraries(ggml-cuda PRIVATE  CUDA::cudart_static CUDA::cublas_static)
+-
+             endif()
+-
+         endif()
+-
+     else()
+-
+         if (GGML_CUDA_CUB_3DOT2)
+-
+             target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
+-
+         endif()
+-
+         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+-
+     endif()
+ 
+-
+-
+     if (GGML_CUDA_NO_VMM)
+-
+         # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
+-
+     else()
+-
+         target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+-
+     endif()
+ 
+-
+-
+     if (GGML_CUDA_NCCL)
+-
+         find_package(NCCL)
+-
+         if (NCCL_FOUND)
+-
+             add_compile_definitions(GGML_USE_NCCL)
+-
+             target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)
+-
+         else()
+-
+             message(STATUS "Warning: NCCL not found, performance for multiple CUDA GPUs will be suboptimal")
+-
+         endif()
+-
+     endif()
+ 
+-
+-
+     set(CUDA_CXX_FLAGS "")
+ 
+-
+-
+     set(CUDA_FLAGS -use_fast_math -extended-lambda)
+ 
+-
+-
+     if (GGML_CUDA_DEBUG)
+-
+         list(APPEND CUDA_FLAGS -lineinfo)
+-
+         add_compile_definitions(GGML_CUDA_DEBUG)
+-
+     endif()
+ 
+-
+-
+     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+-
+         # Options are:
+-
+         # - none (not recommended)
+-
+         # - speed (nvcc's default)
+-
+         # - balance
+-
+         # - size
+-
+         list(APPEND CUDA_FLAGS -compress-mode=${GGML_CUDA_COMPRESSION_MODE})
+-
+     endif()
+ 
+-
+-
+     if (GGML_FATAL_WARNINGS)
+-
+         list(APPEND CUDA_FLAGS -Werror all-warnings)
+-
+     endif()
+ 
+-
+-
+     if (GGML_ALL_WARNINGS AND NOT MSVC)
+-
+         set(NVCC_CMD ${CMAKE_CUDA_COMPILER} .c)
+-
+         if (NOT CMAKE_CUDA_HOST_COMPILER STREQUAL "")
+-
+             list(APPEND NVCC_CMD -ccbin ${CMAKE_CUDA_HOST_COMPILER})
+-
+         endif()
+ 
+-
+-
+         execute_process(
+-
+             COMMAND ${NVCC_CMD} -Xcompiler --version
+-
+             OUTPUT_VARIABLE CUDA_CCFULLVER
+-
+             ERROR_QUIET
+-
+         )
+ 
+-
+-
+         if (NOT CUDA_CCFULLVER MATCHES clang)
+-
+             set(CUDA_CCID "GNU")
+-
+             execute_process(
+-
+                 COMMAND ${NVCC_CMD} -Xcompiler "-dumpfullversion -dumpversion"
+-
+                 OUTPUT_VARIABLE CUDA_CCVER
+-
+                 ERROR_QUIET
+-
+                 OUTPUT_STRIP_TRAILING_WHITESPACE
+-
+             )
+-
+         else()
+-
+             if (CUDA_CCFULLVER MATCHES Apple)
+-
+                 set(CUDA_CCID "AppleClang")
+-
+             else()
+-
+                 set(CUDA_CCID "Clang")
+-
+             endif()
+-
+             string(REGEX REPLACE "^.* version ([0-9.]*).*$" "\\1" CUDA_CCVER ${CUDA_CCFULLVER})
+-
+         endif()
+ 
+-
+-
+         message(STATUS "CUDA host compiler is ${CUDA_CCID} ${CUDA_CCVER}")
+ 
+-
+-
+         ggml_get_flags(${CUDA_CCID} ${CUDA_CCVER})
+-
+         list(APPEND CUDA_CXX_FLAGS ${CXX_FLAGS} ${GF_CXX_FLAGS})  # This is passed to -Xcompiler later
+-
+     endif()
+ 
+-
+-
+     if (NOT MSVC)
+-
+         list(APPEND CUDA_CXX_FLAGS -Wno-pedantic)
+-
+     else()
+-
+         # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
+-
+         # https://github.com/NVIDIA/cccl/pull/6827
+-
+         list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
+-
+     endif()
+ 
+-
+-
+     list(JOIN   CUDA_CXX_FLAGS " " CUDA_CXX_FLAGS_JOINED)  # pass host compiler flags as a single argument
+ 
+-
+-
+     if (NOT CUDA_CXX_FLAGS_JOINED STREQUAL "")
+-
+         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
+-
+     endif()
+ 
+-
+-
+     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+-
+ else()
+-
+     message(FATAL_ERROR "CUDA Toolkit not found")
+-
+ endif()
+-
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index ce3cee5..8644720 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -1,1645 +1,824 @@
+ #include "convert.cuh"
+-
+ #include "turbo-quant.cuh"
+-#include "dequantize.cuh"
+-
+ 
++#include "dequantize.cuh"
+ 
+ #include <cstdint>
+ 
+-
+-
+ #define CUDA_Q8_0_NE_ALIGN 2048
+ 
+-
+-
+ template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+-
+ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
+-
+         const int64_t ne00, const int64_t ne01,
+-
+         const int64_t ne0203, const uint3 ne02,
+-
+         const int64_t s01, const int64_t s02, const int64_t s03) {
+-
+     const int64_t i00 = 2 * (int64_t(blockDim.x)*blockIdx.x + threadIdx.x);
+ 
+-
+-
+     if (i00 >= ne00) {
+-
+         return;
+-
+     }
+ 
+-
+-
+     for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+-
+         for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+-
+             const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02);
+-
+             const int64_t i02 = dm.y;
+-
+             const int64_t i03 = dm.x;
+ 
+-
+-
+             const int64_t ibx0 = i03*s03 + i02*s02 + i01*s01;
+ 
+-
+-
+             const int64_t ib = ibx0 + i00/qk; // block index
+-
+             const int64_t iqs = (i00%qk)/qr; // quant index
+-
+             const int64_t iybs = i00 - i00%qk; // y block start index
+-
+             const int64_t y_offset = qr == 1 ? 1 : qk/2;
+ 
+-
+-
+             // dequantize
+-
+             float2 v;
+-
+             dequantize_kernel(vx, ib, iqs, v);
+ 
+-
+-
+             const int64_t iy0 = (i0203*ne01 + i01)*ne00 + iybs + iqs;
+-
+             y[iy0 + 0]        = ggml_cuda_cast<dst_t>(v.x);
+-
+             y[iy0 + y_offset] = ggml_cuda_cast<dst_t>(v.y);
+-
+         }
+-
+     }
+-
+ }
+ 
+-
+-
+ template <bool need_check>
+-
+ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, half * __restrict__ y, const int64_t k) {
+-
+ #if __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+-
+     constexpr int nint = CUDA_Q8_0_NE_ALIGN/sizeof(int) + WARP_SIZE;
+ 
+-
+-
+     const int64_t   i0 = CUDA_Q8_0_NE_ALIGN*blockIdx.x;
+-
+     const int * x0 = ((int *) vx) + blockIdx.x * nint;
+-
+     half2 * y2 = (half2 *) (y + i0);
+ 
+-
+-
+     __shared__ int vals[nint];
+ 
+-
+-
+ #pragma unroll
+-
+     for (int ix0 = 0; ix0 < nint; ix0 += WARP_SIZE) {
+-
+         if (need_check && i0*sizeof(block_q8_0)/QK8_0 + sizeof(int)*(ix0 + threadIdx.x) >= k*sizeof(block_q8_0)/QK8_0) {
+-
+             break;
+-
+         }
+ 
+-
+-
+         const int ix = ix0 + threadIdx.x;
+-
+         vals[ix] = x0[ix];
+-
+     }
+ 
+-
+-
+     __syncthreads();
+ 
+-
+-
+ #pragma unroll
+-
+     for (int iy = 0; iy < CUDA_Q8_0_NE_ALIGN; iy += 2*WARP_SIZE) {
+-
+         if (need_check && i0 + iy + 2*threadIdx.x >= k) {
+-
+             return;
+-
+         }
+ 
+-
+-
+         const half * b0 = ((const half  *) vals) + (sizeof(block_q8_0)/sizeof(half)) * ((iy + 2*threadIdx.x)/QK8_0);
+-
+         const half    d = *b0;
+-
+         const char2  qs = ((const char2 *) (b0 + 1))[threadIdx.x % (QK8_0/2)];
+ 
+-
+-
+         y2[iy/2 + threadIdx.x] = __hmul2(make_half2(qs.x, qs.y), __half2half2(d));
+-
+     }
+-
+ #else
+-
+     GGML_UNUSED_VARS(vx, y, k);
+-
+     NO_DEVICE_CODE;
+-
+ #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
+ 
+-
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     // assume 32 threads
+-
+     const int64_t tid = threadIdx.x;
+-
+     const int64_t il  = tid/8;
+-
+     const int64_t ir  = tid%8;
+-
+     const int64_t ib = 8*i + ir;
+-
+     if (ib >= nb32) {
+-
+         return;
+-
+     }
+ 
+-
+-
+     dst_t * y = yy + 256*i + 32*ir + 4*il;
+ 
+-
+-
+     const block_q4_0 * x = (const block_q4_0 *)vx + ib;
+-
+     const float d = __half2float(x->d);
+-
+     const float dm = -8*d;
+ 
+-
+-
+     const uint8_t * q = x->qs + 4*il;
+ 
+-
+-
+     for (int l = 0; l < 4; ++l) {
+-
+         y[l+ 0] = ggml_cuda_cast<dst_t>(d * (q[l] & 0xF) + dm);
+-
+         y[l+16] = ggml_cuda_cast<dst_t>(d * (q[l] >>  4) + dm);
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
+ 
+-
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     // assume 32 threads
+-
+     const int64_t tid = threadIdx.x;
+-
+     const int64_t il  = tid/8;
+-
+     const int64_t ir  = tid%8;
+-
+     const int64_t ib = 8*i + ir;
+-
+     if (ib >= nb32) {
+-
+         return;
+-
+     }
+ 
+-
+-
+     dst_t * y = yy + 256*i + 32*ir + 4*il;
+ 
+-
+-
+     const block_q4_1 * x = (const block_q4_1 *)vx + ib;
+-
+     const float2 d = __half22float2(x->dm);
+ 
+-
+-
+     const uint8_t * q = x->qs + 4*il;
+ 
+-
+-
+     for (int l = 0; l < 4; ++l) {
+-
+         y[l+ 0] = ggml_cuda_cast<dst_t>(d.x * (q[l] & 0xF) + d.y);
+-
+         y[l+16] = ggml_cuda_cast<dst_t>(d.x * (q[l] >>  4) + d.y);
+-
+     }
+-
+ }
+ 
+-
+-
+ #if !defined(GGML_USE_HIP)
+-
+ template <typename dst_t>
+-
+ static __device__
+-
+ __forceinline__ void dequantize_ptq1_0_qs4(uint32_t packed, float d, dst_t * __restrict__ y, int base, int stride) {
+-
+     uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+-
+     uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+ 
+-
+-
+ #    pragma unroll
+-
+     for (int t = 0; t < 5; ++t) {
+-
+         const uint32_t w_lo = v_lo * 3;
+-
+         const uint32_t w_hi = v_hi * 3;
+-
+         v_lo                = w_lo & 0x00FF00FF;
+-
+         v_hi                = w_hi & 0x00FF00FF;
+ 
+-
+-
+         const uint32_t q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+-
+ #    pragma unroll
+-
+         for (int b = 0; b < 4; ++b) {
+-
+             const int trit           = (int8_t) (q >> (8 * b));
+-
+             y[base + t * stride + b] = ggml_cuda_cast<dst_t>(d * trit);
+-
+         }
+-
+     }
+-
+ }
+ 
+-
+-
+ template <typename dst_t>
+-
+ static __global__ void dequantize_block_ptq1_0(const block_ptq1_0 * __restrict__ x,
+-
+                                                dst_t * __restrict__ y,
+-
+                                                int64_t nb) {
+-
+     constexpr int    threads_per_quant_block     = 8;
+-
+     constexpr int    quant_blocks_per_cuda_block = CUDA_DEQUANTIZE_BLOCK_SIZE / threads_per_quant_block;
+-
+     // The shared transpose keeps packed-byte ownership while making the CTA stores contiguous.
+-
+     __shared__ dst_t dequantized[quant_blocks_per_cuda_block * QK_PTQ1_0];
+ 
+-
+-
+     const int64_t ib0   = int64_t(blockIdx.x) * quant_blocks_per_cuda_block;
+-
+     const int64_t ib    = ib0 + threadIdx.x / threads_per_quant_block;
+-
+     const int     lane  = threadIdx.x % threads_per_quant_block;
+-
+     const bool    valid = ib < nb;
+ 
+-
+-
+     const block_ptq1_0 * bq = valid ? x + ib : x;
+-
+     float                d  = valid && lane == 7 ? (float) bq->d : 0.0f;
+-
+     d                       = __shfl_sync(__activemask(), d, 7, threads_per_quant_block);
+ 
+-
+-
+     dst_t * out = dequantized + (threadIdx.x / threads_per_quant_block) * QK_PTQ1_0;
+-
+     if (valid && lane < 4) {
+-
+         const uint32_t packed = ((const uint32_t *) bq->qs)[lane];
+-
+         dequantize_ptq1_0_qs4(packed, d, out, 4 * lane, 16);
+-
+     } else if (valid && lane < 6) {
+-
+         const int      g      = lane - 4;
+-
+         const uint32_t packed = ((const uint32_t *) (bq->qs + 16))[g];
+-
+         dequantize_ptq1_0_qs4(packed, d, out, 80 + 4 * g, 8);
+-
+     } else if (valid && lane == 6) {
+-
+         uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+-
+ #    pragma unroll
+-
+         for (int t = 0; t < 4; ++t) {
+-
+             const uint32_t w     = v * 3;
+-
+             v                    = w & 0x00FF00FF;
+-
+             out[120 + 2 * t + 0] = ggml_cuda_cast<dst_t>(d * ((int) ((w >> 8) & 0xFF) - 1));
+-
+             out[120 + 2 * t + 1] = ggml_cuda_cast<dst_t>(d * ((int) ((w >> 24) & 0xFF) - 1));
+-
+         }
+-
+     }
+ 
+-
+-
+     __syncthreads();
+-
+     const int nblocks   = nb - ib0 < quant_blocks_per_cuda_block ? nb - ib0 : quant_blocks_per_cuda_block;
+-
+     const int nelements = nblocks * QK_PTQ1_0;
+-
+     for (int i = threadIdx.x; i < nelements; i += CUDA_DEQUANTIZE_BLOCK_SIZE) {
+-
+         y[ib0 * QK_PTQ1_0 + i] = dequantized[i];
+-
+     }
+-
+ }
+ 
+-
+-
+ template <typename dst_t>
+-
+ static void dequantize_row_ptq1_0_cuda(const void * __restrict__ vx,
+-
+                                        dst_t * __restrict__ y,
+-
+                                        const int64_t k,
+-
+                                        cudaStream_t  stream) {
+-
+     GGML_ASSERT(k % QK_PTQ1_0 == 0);
+-
+     constexpr int quant_blocks_per_cuda_block = CUDA_DEQUANTIZE_BLOCK_SIZE / 8;
+-
+     const int64_t nb                          = k / QK_PTQ1_0;
+-
+     const int     num_blocks                  = (nb + quant_blocks_per_cuda_block - 1) / quant_blocks_per_cuda_block;
+-
+     dequantize_block_ptq1_0<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const block_ptq1_0 *) vx, y, nb);
+-
+ }
+-
+ #endif
+ 
+-
+-
+ //================================== k-quants
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_q2_K(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_q3_K(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_q4_K(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_q5_K(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq2_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq2_xxs(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq2_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq2_xs(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq2_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq2_s(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq3_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq3_xxs(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq3_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq3_s(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq1_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq1_s(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq1_m(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+-    dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x);
+-
+-}
+-
+-
++    dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x);
++}
+ 
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_iq4_xs(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+-
+     const int64_t i = blockIdx.x;
+ 
+-
+-
+     dequantize_mxfp4(vx, i, yy + i*QK_K, threadIdx.x);
+-
+ }
+ 
+-
+-
+ template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+-
+ static void dequantize_block_cuda(const void * vx, dst_t * y,
+-
+         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+-
+         const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+-
+     const int64_t ne0203 = ne02*ne03;
+-
+     const uint3 ne02_fdv = init_fastdiv_values(ne02);
+-
+     const dim3 num_blocks((ne00 + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE), (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
+-
+     dequantize_block<qk, qr, dequantize_kernel><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
+-
+         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+-
+ }
+ 
+-
+-
+ template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+-
+ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k, cudaStream_t stream) {
+-
+     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
+-
+ }
+ 
+-
+-
+ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
+-
+     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
+-
+     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
+-
+         const bool need_check = false;
+-
+         dequantize_block_q8_0_f16<need_check><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, k);
+-
+     } else {
+-
+         const bool need_check = true;
+-
+         dequantize_block_q8_0_f16<need_check><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, k);
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_q3_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_q3_K<<<nb, 64, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_q4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb32 = k / 32;
+-
+     const int nb = (k + 255) / 256;
+-
+     dequantize_block_q4_0<<<nb, 32, 0, stream>>>(vx, y, nb32);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb32 = k / 32;
+-
+     const int nb = (k + 255) / 256;
+-
+     dequantize_block_q4_1<<<nb, 32, 0, stream>>>(vx, y, nb32);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_iq2_xs<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_iq1_s<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = (k + QK_K - 1) / QK_K;
+-
+     dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = k / QK_K;
+-
+     dequantize_block_iq1_m<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = (k + QK_K - 1) / QK_K;
+-
+     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     const int nb = (k + QK_K - 1) / QK_K;
+-
+     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
+-
+ }
+ 
+-
+-
+ template <typename dst_t>
+-
+ static __global__ void dequantize_block_nvfp4(
+-
+         const void * __restrict__ vx,
+-
+         dst_t * __restrict__ yy,
+-
+         const int64_t ne) {
+-
+     const int64_t i = blockIdx.x;
+-
+     const int     tid = threadIdx.x;
+ 
+-
+-
+     const int64_t base = i * QK_NVFP4;
+-
+     if (base >= ne) {
+-
+         return;
+-
+     }
+ 
+-
+-
+     const block_nvfp4 * x = (const block_nvfp4 *) vx;
+-
+     const block_nvfp4 & xb = x[i];
+ 
+-
+-
+     const int sub = tid / (QK_NVFP4_SUB / 2);
+-
+     const int j = tid % (QK_NVFP4_SUB / 2);
+ 
+-
+-
+     const float d = ggml_cuda_ue4m3_to_fp32(xb.d[sub]);
+-
+     const uint8_t q = xb.qs[sub * (QK_NVFP4_SUB / 2) + j];
+ 
+-
+-
+     const int64_t y0 = base + sub * QK_NVFP4_SUB + j;
+-
+     const int64_t y1 = y0 + QK_NVFP4_SUB / 2;
+ 
+-
+-
+     yy[y0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q & 0x0F]);
+-
+     yy[y1] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
+-
+ }
+ 
+-
+-
+ template <typename dst_t>
+-
+ static void dequantize_row_nvfp4_cuda(
+-
+         const void * vx,
+-
+         dst_t * y,
+-
+         const int64_t k,
+-
+         cudaStream_t stream) {
+-
+     GGML_ASSERT(k % QK_NVFP4 == 0);
+-
+     const int nb = k / QK_NVFP4;
+-
+     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
+-
+ }
+-
+ template <typename src_t, typename dst_t>
+-
+ static __global__ void convert_unary(
+-
+         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
+-
+         const int64_t ne0203, const uint3 ne02,
+-
+         const int64_t s01, const int64_t s02, const int64_t s03) {
+-
+     const int64_t i00 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+ 
+-
+-
+     if (i00 >= ne00) {
+-
+         return;
+-
+     }
+ 
+-
+-
+     const src_t * x = (const src_t *) vx;
+ 
+-
+-
+     for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+-
+         for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+-
+             const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02);
+-
+             const int64_t i02 = dm.y;
+-
+             const int64_t i03 = dm.x;
+ 
+-
+-
+             const int64_t ix = i03*s03 + i02*s02 + i01*s01 + i00;
+-
+             const int64_t iy = (i0203*ne01 + i01)*ne00 + i00;
+-
+             y[iy] = ggml_cuda_cast<dst_t>(x[ix]);
+-
+         }
+-
+     }
+-
+ }
+ 
+-
+-
+ template <typename src_t, typename dst_t>
+-
+ static void convert_unary_cuda(const void * vx, dst_t * y,
+-
+         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+-
+         const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+-
+     const int64_t ne0203 = ne02*ne03;
+-
+     const uint3 ne02_fdv = init_fastdiv_values(ne02);
+-
+     const dim3 num_blocks((ne00 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
+-
+     convert_unary<src_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
+-
+         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+-
+ }
+ 
+-
+-
+ template <typename src_t, typename dst_t>
+-
+ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+-
+     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
+-
+ }
+ 
+-
+-
+ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
+-
+     switch (type) {
+-
+         case GGML_TYPE_Q1_0:
+-
+             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
+-
+         case GGML_TYPE_Q2_0:
+-
+             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+-
+         case GGML_TYPE_PQ2_0:
+-
+             return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+-
+         case GGML_TYPE_PTQ1_0:
+-
+ #if !defined(GGML_USE_HIP)
+-
+             return dequantize_row_ptq1_0_cuda;
+-
+ #else
+-
+             return dequantize_block_cont_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+-
+ #endif
+-
+         case GGML_TYPE_Q4_0:
+-
+             return dequantize_row_q4_0_cuda;
+-
+         case GGML_TYPE_Q4_1:
+-
+             return dequantize_row_q4_1_cuda;
+-
+         case GGML_TYPE_Q5_0:
+-
+             return dequantize_block_cont_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+-
+         case GGML_TYPE_Q5_1:
+-
+             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+-
+         case GGML_TYPE_Q8_0:
+-
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+-
+         case GGML_TYPE_Q2_K:
+-
+             return dequantize_row_q2_K_cuda;
+-
+         case GGML_TYPE_Q3_K:
+-
+             return dequantize_row_q3_K_cuda;
+-
+         case GGML_TYPE_Q4_K:
+-
+             return dequantize_row_q4_K_cuda;
+-
+         case GGML_TYPE_Q5_K:
+-
+             return dequantize_row_q5_K_cuda;
+-
+         case GGML_TYPE_Q6_K:
+-
+             return dequantize_row_q6_K_cuda;
+-
+         case GGML_TYPE_IQ2_XXS:
+-
+             return dequantize_row_iq2_xxs_cuda;
+-
+         case GGML_TYPE_IQ2_XS:
+-
+             return dequantize_row_iq2_xs_cuda;
+-
+         case GGML_TYPE_IQ2_S:
+-
+             return dequantize_row_iq2_s_cuda;
+-
+         case GGML_TYPE_IQ3_XXS:
+-
+             return dequantize_row_iq3_xxs_cuda;
+-
+         case GGML_TYPE_IQ1_S:
+-
+             return dequantize_row_iq1_s_cuda;
+-
+         case GGML_TYPE_IQ1_M:
+-
+             return dequantize_row_iq1_m_cuda;
+-
+         case GGML_TYPE_IQ4_NL:
+-
+             return dequantize_row_iq4_nl_cuda;
+-
+         case GGML_TYPE_IQ4_XS:
+-
+             return dequantize_row_iq4_xs_cuda;
+-
+         case GGML_TYPE_IQ3_S:
+-
+             return dequantize_row_iq3_s_cuda;
+-
+         case GGML_TYPE_MXFP4:
+-
+             return dequantize_row_mxfp4_cuda;
+-
+         case GGML_TYPE_NVFP4:
+-
+             return dequantize_row_nvfp4_cuda;
+-
+         case GGML_TYPE_F32:
+-
+             return convert_unary_cont_cuda<float>;
+-
+         case GGML_TYPE_F16:
+-
+             return convert_unary_cont_cuda<half>;
+-
+         default:
+-
+             return nullptr;
+-
+     }
+-
+ }
+ 
+-
+-
+ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+-
+     switch (type) {
+-
+         case GGML_TYPE_Q1_0:
+-
+             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
+-
+         case GGML_TYPE_Q2_0:
+-
+             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+-
+         case GGML_TYPE_PQ2_0:
+-
+             return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+-
+         case GGML_TYPE_PTQ1_0:
+-
+ #if !defined(GGML_USE_HIP)
+-
+             return dequantize_row_ptq1_0_cuda;
+-
+ #else
+-
+             return dequantize_block_cont_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+-
+ #endif
+-
+         case GGML_TYPE_Q4_0:
+-
+             return dequantize_row_q4_0_cuda;
+-
+         case GGML_TYPE_Q4_1:
+-
+             return dequantize_row_q4_1_cuda;
+-
+         case GGML_TYPE_Q5_0:
+-
+             return dequantize_block_cont_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+-
+         case GGML_TYPE_Q5_1:
+-
+             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+-
+         case GGML_TYPE_Q8_0:
+-
+             if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+-
+                 return dequantize_block_q8_0_f16_cuda;
+-
+             }
+-
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+-
+         case GGML_TYPE_Q2_K:
+-
+             return dequantize_row_q2_K_cuda;
+-
+         case GGML_TYPE_Q3_K:
+-
+             return dequantize_row_q3_K_cuda;
+-
+         case GGML_TYPE_Q4_K:
+-
+             return dequantize_row_q4_K_cuda;
+-
+         case GGML_TYPE_Q5_K:
+-
+             return dequantize_row_q5_K_cuda;
+-
+         case GGML_TYPE_Q6_K:
+-
+             return dequantize_row_q6_K_cuda;
+-
+         case GGML_TYPE_IQ2_XXS:
+-
+             return dequantize_row_iq2_xxs_cuda;
+-
+         case GGML_TYPE_IQ2_XS:
+-
+             return dequantize_row_iq2_xs_cuda;
+-
+         case GGML_TYPE_IQ2_S:
+-
+             return dequantize_row_iq2_s_cuda;
+-
+         case GGML_TYPE_IQ3_XXS:
+-
+             return dequantize_row_iq3_xxs_cuda;
+-
+         case GGML_TYPE_IQ1_S:
+-
+             return dequantize_row_iq1_s_cuda;
+-
+         case GGML_TYPE_IQ1_M:
+-
+             return dequantize_row_iq1_m_cuda;
+-
+         case GGML_TYPE_IQ4_NL:
+-
+             return dequantize_row_iq4_nl_cuda;
+-
+         case GGML_TYPE_IQ4_XS:
+-
+             return dequantize_row_iq4_xs_cuda;
+-
+         case GGML_TYPE_IQ3_S:
+-
+             return dequantize_row_iq3_s_cuda;
+-
+         case GGML_TYPE_MXFP4:
+-
+             return dequantize_row_mxfp4_cuda;
+-
+         case GGML_TYPE_NVFP4:
+-
+             return dequantize_row_nvfp4_cuda;
+-
+         case GGML_TYPE_F32:
+-
+             return convert_unary_cont_cuda<float>;
+-
+         case GGML_TYPE_BF16:
+-
+             return convert_unary_cont_cuda<nv_bfloat16>;
+-
+         default:
+-
+             return nullptr;
+-
+     }
+-
+ }
+ 
+-
+-
+ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+-
+     switch (type) {
+-
+         case GGML_TYPE_Q1_0:
+-
+             return dequantize_block_cont_cuda<QK1_0, QR1_0, dequantize_q1_0>;
+-
+         case GGML_TYPE_Q2_0:
+-
+             return dequantize_block_cont_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+-
+         case GGML_TYPE_PQ2_0:
+-
+             return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+-
+         case GGML_TYPE_PTQ1_0:
+-
+ #if !defined(GGML_USE_HIP)
+-
+             return dequantize_row_ptq1_0_cuda;
+-
+ #else
+-
+             return dequantize_block_cont_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+-
+ #endif
+-
+         case GGML_TYPE_Q4_0:
+-
+             return dequantize_row_q4_0_cuda;
+-
+         case GGML_TYPE_Q4_1:
+-
+             return dequantize_row_q4_1_cuda;
+-
+         case GGML_TYPE_Q5_0:
+-
+             return dequantize_block_cont_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+-
+         case GGML_TYPE_Q5_1:
+-
+             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+-
+         case GGML_TYPE_Q8_0:
+-
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+-
+         case GGML_TYPE_Q2_K:
+-
+             return dequantize_row_q2_K_cuda;
+-
+         case GGML_TYPE_Q3_K:
+-
+             return dequantize_row_q3_K_cuda;
+-
+         case GGML_TYPE_Q4_K:
+-
+             return dequantize_row_q4_K_cuda;
+-
+         case GGML_TYPE_Q5_K:
+-
+             return dequantize_row_q5_K_cuda;
+-
+         case GGML_TYPE_Q6_K:
+-
+             return dequantize_row_q6_K_cuda;
+-
+         case GGML_TYPE_IQ2_XXS:
+-
+             return dequantize_row_iq2_xxs_cuda;
+-
+         case GGML_TYPE_IQ2_XS:
+-
+             return dequantize_row_iq2_xs_cuda;
+-
+         case GGML_TYPE_IQ2_S:
+-
+             return dequantize_row_iq2_s_cuda;
+-
+         case GGML_TYPE_IQ3_XXS:
+-
+             return dequantize_row_iq3_xxs_cuda;
+-
+         case GGML_TYPE_IQ1_S:
+-
+             return dequantize_row_iq1_s_cuda;
+-
+         case GGML_TYPE_IQ1_M:
+-
+             return dequantize_row_iq1_m_cuda;
+-
+         case GGML_TYPE_IQ4_NL:
+-
+             return dequantize_row_iq4_nl_cuda;
+-
+         case GGML_TYPE_IQ4_XS:
+-
+             return dequantize_row_iq4_xs_cuda;
+-
+         case GGML_TYPE_IQ3_S:
+-
+             return dequantize_row_iq3_s_cuda;
+-
+         case GGML_TYPE_MXFP4:
+-
+             return dequantize_row_mxfp4_cuda;
+-
+         case GGML_TYPE_NVFP4:
+-
+             return dequantize_row_nvfp4_cuda;
+-
+         case GGML_TYPE_F16:
+-
+             return convert_unary_cont_cuda<half>;
+-
+         case GGML_TYPE_BF16:
+-
+             return convert_unary_cont_cuda<nv_bfloat16>;
+-
+         default:
+-
+             return nullptr;
+-
+     }
+-
+ }
+ 
+-
+-
+ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+-
+     switch (type) {
+-
+         case GGML_TYPE_F32:
+-
+             return convert_unary_cuda<float>;
+-
+         case GGML_TYPE_Q1_0:
+-
+             return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
+-
+         case GGML_TYPE_Q2_0:
+-
+             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+-
+         case GGML_TYPE_PQ2_0:
+-
+             return dequantize_block_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+-
+         case GGML_TYPE_PTQ1_0:
+-
+             return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+-
+         case GGML_TYPE_Q4_0:
+-
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+-
+         case GGML_TYPE_Q4_1:
+-
+             return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;
+-
+         case GGML_TYPE_Q5_0:
+-
+             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+-
+         case GGML_TYPE_Q5_1:
+-
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+-
+         case GGML_TYPE_Q8_0:
+-
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+-
+         case GGML_TYPE_BF16:
+-
+             return convert_unary_cuda<nv_bfloat16>;
+-
+         default:
+-
+             return nullptr;
+-
+     }
+-
+ }
+ 
+-
+-
+ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
+-
+     switch (type) {
+-
+         case GGML_TYPE_F32:
+-
+             return convert_unary_cuda<float, nv_bfloat16>;
+-
+         case GGML_TYPE_Q1_0:
+-
+             return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
+-
+         case GGML_TYPE_Q2_0:
+-
+             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+-
+         case GGML_TYPE_PQ2_0:
+-
+             return dequantize_block_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+-
+         case GGML_TYPE_PTQ1_0:
+-
+             return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+-
+         case GGML_TYPE_Q4_0:
+-
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+-
+         case GGML_TYPE_Q4_1:
+-
+             return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;
+-
+         case GGML_TYPE_Q5_0:
+-
+             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+-
+         case GGML_TYPE_Q5_1:
+-
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+-
+         case GGML_TYPE_Q8_0:
+-
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+-
+         case GGML_TYPE_F16:
+-
+             return convert_unary_cuda<half, nv_bfloat16>;
+-
+         default:
+-
+             return nullptr;
+-
+     }
+-
+ }
+ 
+-
+-
+ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
+-
+     switch (type) {
+-
+         case GGML_TYPE_F16:
+-
+             return convert_unary_cuda<half, float>;
+-
+         case GGML_TYPE_Q1_0:
+-
+             return dequantize_block_cuda<QK1_0, QR1_0, dequantize_q1_0>;
+-
+         case GGML_TYPE_Q2_0:
+-
+             return dequantize_block_cuda<QK2_0, QR2_0, dequantize_q2_0>;
+-
+         case GGML_TYPE_PQ2_0:
+-
+             return dequantize_block_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
+-
+         case GGML_TYPE_PTQ1_0:
+-
+             return dequantize_block_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
+-
+         case GGML_TYPE_Q4_0:
+-
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+-
+         case GGML_TYPE_Q4_1:
+-
+             return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;
+-
+         case GGML_TYPE_Q5_0:
+-
+             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+-
+         case GGML_TYPE_Q5_1:
+-
+             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+-
+         case GGML_TYPE_Q8_0:
+-
+             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+-
+         case GGML_TYPE_BF16:
+-
+             return convert_unary_cuda<nv_bfloat16, float>;
+-
+         default:
+-
+             return nullptr;
+-
+     }
+-
+ }
+-
+diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+index 381445f..7d5c7f8 100644
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -1,300 +1,153 @@
+ #include "common.cuh"
+-
+ #include "turbo-quant.cuh"
+-#include "convert.cuh"
+-
+ 
++#include "convert.cuh"
+ 
+ static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_q1_0 * x = (const block_q1_0 *) vx;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     const int bit_index_0 = iqs;
+-
+     const int bit_index_1 = iqs + 1;
+ 
+-
+-
+     const int byte_index_0 = bit_index_0 / 8;
+-
+     const int bit_offset_0 = bit_index_0 % 8;
+ 
+-
+-
+     const int byte_index_1 = bit_index_1 / 8;
+-
+     const int bit_offset_1 = bit_index_1 % 8;
+ 
+-
+-
+     // Extract bits: 1 = +d, 0 = -d (branchless)
+-
+     const int bit_0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 1;
+-
+     const int bit_1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 1;
+ 
+-
+-
+     v.x = (2*bit_0 - 1) * d;
+-
+     v.y = (2*bit_1 - 1) * d;
+-
+ }
+ 
+-
+-
+ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_q2_0 * x = (const block_q2_0 *) vx;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     // Q2_0: 2 bits per element, 4 elements per byte.
+-
+     // Stored code c in {0,1,2,3} maps to symbol s = c - 1 in {-1, 0, +1, +2}.
+-
+     const int byte_index_0 = iqs / 4;
+-
+     const int bit_offset_0 = (iqs % 4) * 2;
+ 
+-
+-
+     const int byte_index_1 = (iqs + 1) / 4;
+-
+     const int bit_offset_1 = ((iqs + 1) % 4) * 2;
+ 
+-
+-
+     const int c0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 0x3;
+-
+     const int c1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 0x3;
+ 
+-
+-
+     v.x = (c0 - 1) * d;
+-
+     v.y = (c1 - 1) * d;
+-
+ }
+ 
+ 
+-
+-
+-
+ static __device__ __forceinline__ void dequantize_ptq1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_ptq1_0 * x = (const block_ptq1_0 *) vx;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     v.x = ptq1_0_trit(&x[ib], iqs + 0) * d;
+-
+     v.y = ptq1_0_trit(&x[ib], iqs + 1) * d;
+-
+ }
+ 
+-
+-
+ static __device__ __forceinline__ void dequantize_pq2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_pq2_0 * x = (const block_pq2_0 *) vx;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     // Same 2-bit codec as Q2_0 (per-element indexing is block-size independent).
+-
+     const int byte_index_0 = iqs / 4;
+-
+     const int bit_offset_0 = (iqs % 4) * 2;
+ 
+-
+-
+     const int byte_index_1 = (iqs + 1) / 4;
+-
+     const int bit_offset_1 = ((iqs + 1) % 4) * 2;
+ 
+-
+-
+     const int c0 = (x[ib].qs[byte_index_0] >> bit_offset_0) & 0x3;
+-
+     const int c1 = (x[ib].qs[byte_index_1] >> bit_offset_1) & 0x3;
+ 
+-
+-
+     v.x = (c0 - 1) * d;
+-
+     v.y = (c1 - 1) * d;
+-
+ }
+ 
+-
+-
+ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_q4_0 * x = (const block_q4_0 *) vx;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     const int vui = x[ib].qs[iqs];
+ 
+-
+-
+     v.x = vui & 0xF;
+-
+     v.y = vui >> 4;
+ 
+-
+-
+     v.x = (v.x - 8.0f) * d;
+-
+     v.y = (v.y - 8.0f) * d;
+-
+ }
+ 
+-
+-
+ static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_q4_1 * x = (const block_q4_1 *) vx;
+ 
+-
+-
+     const float2 dm = __half22float2(x[ib].dm);
+ 
+-
+-
+     const int vui = x[ib].qs[iqs];
+ 
+-
+-
+     v.x = vui & 0xF;
+-
+     v.y = vui >> 4;
+ 
+-
+-
+     v.x = (v.x * dm.x) + dm.y;
+-
+     v.y = (v.y * dm.x) + dm.y;
+-
+ }
+ 
+-
+-
+ static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_q5_0 * x = (const block_q5_0 *) vx;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     uint32_t qh;
+-
+     memcpy(&qh, x[ib].qh, sizeof(qh));
+ 
+-
+-
+     const int xh_0 = ((qh >> (iqs +  0)) << 4) & 0x10;
+-
+     const int xh_1 = ((qh >> (iqs + 12))     ) & 0x10;
+ 
+-
+-
+     v.x = ((x[ib].qs[iqs] & 0xf) | xh_0);
+-
+     v.y = ((x[ib].qs[iqs] >>  4) | xh_1);
+ 
+-
+-
+     v.x = (v.x - 16.0f) * d;
+-
+     v.y = (v.y - 16.0f) * d;
+-
+ }
+ 
+-
+-
+ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_q5_1 * x = (const block_q5_1 *) vx;
+ 
+-
+-
+     const float2 dm = __half22float2(x[ib].dm);
+ 
+-
+-
+     uint32_t qh;
+-
+     memcpy(&qh, x[ib].qh, sizeof(qh));
+ 
+-
+-
+     const int xh_0 = ((qh >> (iqs +  0)) << 4) & 0x10;
+-
+     const int xh_1 = ((qh >> (iqs + 12))     ) & 0x10;
+ 
+-
+-
+     v.x = ((x[ib].qs[iqs] & 0xf) | xh_0);
+-
+     v.y = ((x[ib].qs[iqs] >>  4) | xh_1);
+ 
+-
+-
+     v.x = (v.x * dm.x) + dm.y;
+-
+     v.y = (v.y * dm.x) + dm.y;
+-
+ }
+ 
+-
+-
+ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+-
+     const block_q8_0 * x = (const block_q8_0 *) vx;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     v.x = x[ib].qs[iqs + 0];
+-
+     v.y = x[ib].qs[iqs + 1];
+ 
+-
+-
+     v.x *= d;
+-
+ }
+-
+ // Turbo3: 3-bit PolarQuant (2-bit qs + 1-bit sign), block size 32
+ static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+     const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+@@ -302,7 +155,6 @@ static __device__ __forceinline__ void dequantize_turbo3_0(const void * vx, cons
+     v.x = turbo3_dequant_element(&x[ib], iqs + 0, norm);
+     v.y = turbo3_dequant_element(&x[ib], iqs + 1, norm);
+ }
+-
+ // Turbo4: 4-bit PolarQuant (nibble packed), block size 128
+ static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+@@ -312,667 +164,334 @@ static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, cons
+ 
+ }
+ 
+-
+-
+ //================================== k-quants
+ 
+-
+-
+ // Each call dequantizes one super-block of QK_K values into y using the
+-
+ // thread layout of the caller: 32 threads for q4_K, 64 threads otherwise.
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_q2_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+-
+     const block_q2_K * x = (const block_q2_K *) vx;
+ 
+-
+-
+     const int64_t n   = tid/32;
+-
+     const int64_t l   = tid - 32*n;
+-
+     const int64_t is  = 8*n + l/16;
+ 
+-
+-
+     const uint8_t q = x[ib].qs[32*n + l];
+-
+     dst_t * y = yy + 128*n;
+ 
+-
+-
+     float dall = __low2half(x[ib].dm);
+-
+     float dmin = __high2half(x[ib].dm);
+-
+     y[l+ 0] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[ib].scales[is+0] >> 4));
+-
+     y[l+32] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[ib].scales[is+2] >> 4));
+-
+     y[l+64] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[ib].scales[is+4] >> 4));
+-
+     y[l+96] = ggml_cuda_cast<dst_t>(dall * (x[ib].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[ib].scales[is+6] >> 4));
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_q3_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+-
+     const block_q3_K * x = (const block_q3_K *) vx;
+ 
+-
+-
+     const int64_t r = tid/4;
+-
+     const int64_t t = r/2;
+-
+     const int64_t is0 = r%2;
+-
+     const int64_t l0 = 16*is0 + 4*(tid%4);
+-
+     const int64_t n = t / 4;
+-
+     const int64_t j = t - 4*n;
+ 
+-
+-
+     uint8_t m = 1 << (4*n + j);
+-
+     int64_t is = 8*n + 2*j + is0;
+-
+     int shift = 2*j;
+ 
+-
+-
+     int8_t us = is <  4 ? (x[ib].scales[is-0] & 0xF) | (((x[ib].scales[is+8] >> 0) & 3) << 4) :
+-
+                 is <  8 ? (x[ib].scales[is-0] & 0xF) | (((x[ib].scales[is+4] >> 2) & 3) << 4) :
+-
+                 is < 12 ? (x[ib].scales[is-8] >>  4) | (((x[ib].scales[is+0] >> 4) & 3) << 4) :
+-
+                           (x[ib].scales[is-8] >>  4) | (((x[ib].scales[is-4] >> 6) & 3) << 4);
+-
+     float d_all = x[ib].d;
+-
+     float dl = d_all * (us - 32);
+ 
+-
+-
+     dst_t * y = yy + 128*n + 32*j;
+-
+     const uint8_t * q = x[ib].qs + 32*n;
+-
+     const uint8_t * hm = x[ib].hmask;
+ 
+-
+-
+     for (int l = l0; l < l0+4; ++l) {
+-
+         y[l] = ggml_cuda_cast<dst_t>(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+-
+     }
+-
+ }
+ 
+-
+-
+ static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+-
+     if (j < 4) {
+-
+         d = q[j] & 63; m = q[j + 4] & 63;
+-
+     } else {
+-
+         d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+-
+         m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_q4_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+-
+     const block_q4_K * x = (const block_q4_K *) vx;
+ 
+-
+-
+     // assume 32 threads
+-
+     const int64_t il  = tid/8;
+-
+     const int64_t ir  = tid%8;
+-
+     const int64_t is  = 2*il;
+-
+     const int64_t n   = 4;
+ 
+-
+-
+     dst_t * y = yy + 64*il + n*ir;
+ 
+-
+-
+     const float dall = __low2half(x[ib].dm);
+-
+     const float dmin = __high2half(x[ib].dm);
+ 
+-
+-
+     const uint8_t * q = x[ib].qs + 32*il + n*ir;
+ 
+-
+-
+     uint8_t sc, m;
+-
+     get_scale_min_k4(is + 0, x[ib].scales, sc, m);
+-
+     const float d1 = dall * sc; const float m1 = dmin * m;
+-
+     get_scale_min_k4(is + 1, x[ib].scales, sc, m);
+-
+     const float d2 = dall * sc; const float m2 = dmin * m;
+-
+     for (int l = 0; l < n; ++l) {
+-
+         y[l + 0] = ggml_cuda_cast<dst_t>(d1 * (q[l] & 0xF) - m1);
+-
+         y[l +32] = ggml_cuda_cast<dst_t>(d2 * (q[l] >>  4) - m2);
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_q5_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+-
+     const block_q5_K * x = (const block_q5_K *) vx;
+ 
+-
+-
+     // assume 64 threads - this is very slightly better than the one below
+-
+     const int64_t il  = tid/16;   // il is in 0...3
+-
+     const int64_t ir  = tid%16;   // ir is in 0...15
+-
+     const int64_t is  = 2*il;     // is is in 0...6
+ 
+-
+-
+     dst_t * y = yy + 64*il + 2*ir;
+ 
+-
+-
+     const float dall = __low2half(x[ib].dm);
+-
+     const float dmin = __high2half(x[ib].dm);
+ 
+-
+-
+     const uint8_t * ql = x[ib].qs + 32*il + 2*ir;
+-
+     const uint8_t * qh = x[ib].qh + 2*ir;
+ 
+-
+-
+     uint8_t sc, m;
+-
+     get_scale_min_k4(is + 0, x[ib].scales, sc, m);
+-
+     const float d1 = dall * sc; const float m1 = dmin * m;
+-
+     get_scale_min_k4(is + 1, x[ib].scales, sc, m);
+-
+     const float d2 = dall * sc; const float m2 = dmin * m;
+ 
+-
+-
+     uint8_t   hm  = 1 << (2*il);
+-
+     y[ 0] = ggml_cuda_cast<dst_t>(d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1);
+-
+     y[ 1] = ggml_cuda_cast<dst_t>(d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1);
+-
+     hm <<= 1;
+-
+     y[32] = ggml_cuda_cast<dst_t>(d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2);
+-
+     y[33] = ggml_cuda_cast<dst_t>(d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2);
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_q6_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+-
+     const block_q6_K * x = (const block_q6_K *) vx;
+ 
+-
+-
+     // assume 64 threads - this is very slightly better than the one below
+-
+     const int64_t ip  = tid/32;   // ip is 0 or 1
+-
+     const int64_t il  = tid - 32*ip; // 0...32
+-
+     const int64_t is  = 8*ip + il/16;
+ 
+-
+-
+     dst_t * y = yy + 128*ip + il;
+ 
+-
+-
+     const float d = x[ib].d;
+ 
+-
+-
+     const uint8_t * ql = x[ib].ql + 64*ip + il;
+-
+     const uint8_t   qh = x[ib].qh[32*ip + il];
+-
+     const int8_t  * sc = x[ib].scales + is;
+ 
+-
+-
+     y[ 0] = ggml_cuda_cast<dst_t>(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+-
+     y[32] = ggml_cuda_cast<dst_t>(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+-
+     y[64] = ggml_cuda_cast<dst_t>(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+-
+     y[96] = ggml_cuda_cast<dst_t>(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+-
+ }
+ 
+-
+-
+ //================================== i-quants
+ 
+-
+-
+ // Each call dequantizes one super-block of QK_K values into y with 32
+-
+ // threads; iq4_nl packs QK_K/QK4_NL sub-blocks per super-block.
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq2_xxs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq2_xxs * x = (const block_iq2_xxs  *) vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 8*il;
+-
+     const uint16_t * q2 = x[ibs].qs + 4*ib;
+-
+     const uint8_t  * aux8 = (const uint8_t *)q2;
+-
+     const uint8_t  * grid = (const uint8_t *)(iq2xxs_grid + aux8[il]);
+-
+     const uint32_t aux32 = q2[2] | (q2[3] << 16);
+-
+     const float d = (float)x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
+-
+     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+-
+     for (int j = 0; j < 8; ++j) {
+-
+         y[j] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq2_xs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq2_xs * x = (const block_iq2_xs *) vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 8*il;
+-
+     const uint16_t * q2 = x[ibs].qs + 4*ib;
+-
+     const uint8_t  * grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+-
+     const float d = (float)x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+-
+     const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+-
+     for (int j = 0; j < 8; ++j) {
+-
+         y[j] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq2_s(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq2_s * x = (const block_iq2_s *) vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 8*il;
+-
+     const uint8_t * grid = (const uint8_t *)(iq2s_grid + (x[ibs].qs[4*ib+il] | ((x[ibs].qh[ib] << (8-2*il)) & 0x300)));
+-
+     const float d = (float)x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+-
+     const uint8_t signs = x[ibs].qs[QK_K/8+4*ib+il];
+-
+     for (int j = 0; j < 8; ++j) {
+-
+         y[j] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq3_xxs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq3_xxs * x = (const block_iq3_xxs  *) vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 8*il;
+-
+     const uint8_t  * q3 = x[ibs].qs + 8*ib;
+-
+     const uint16_t * gas = (const uint16_t *)(x[ibs].qs + QK_K/4) + 2*ib;
+-
+     const uint8_t  * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2*il+0]);
+-
+     const uint8_t  * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2*il+1]);
+-
+     const uint32_t aux32 = gas[0] | (gas[1] << 16);
+-
+     const float d = (float)x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
+-
+     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+-
+     for (int j = 0; j < 4; ++j) {
+-
+         y[j+0] = ggml_cuda_cast<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f));
+-
+         y[j+4] = ggml_cuda_cast<dst_t>(d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f));
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq3_s(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq3_s * x = (const block_iq3_s *) vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 8*il;
+-
+     const uint8_t * qs = x[ibs].qs + 8*ib;
+-
+     const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*il+0] | ((x[ibs].qh[ib] << (8-2*il)) & 256)));
+-
+     const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*il+1] | ((x[ibs].qh[ib] << (7-2*il)) & 256)));
+-
+     const float d = (float)x[ibs].d * (1 + 2*((x[ibs].scales[ib/2] >> 4*(ib%2)) & 0xf));
+-
+     const uint8_t signs = x[ibs].signs[4*ib + il];
+-
+     for (int j = 0; j < 4; ++j) {
+-
+         y[j+0] = ggml_cuda_cast<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f));
+-
+         y[j+4] = ggml_cuda_cast<dst_t>(d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f));
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq1_s(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq1_s * x = (const block_iq1_s  *) vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 8*il;
+-
+     const float delta = x[ibs].qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+-
+     const float d = (float)x[ibs].d * (2*((x[ibs].qh[ib] >> 12) & 7) + 1);
+-
+     uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+-
+     grid32[0] = iq1s_grid_gpu[x[ibs].qs[4*ib+il] | (((x[ibs].qh[ib] >> 3*il) & 7) << 8)];
+-
+     grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+-
+     grid32[0] &= 0x0f0f0f0f;
+-
+     for (int j = 0; j < 8; ++j) {
+-
+         y[j] = ggml_cuda_cast<dst_t>(d * (q[j] + delta));
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq1_m(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq1_m * x = (const block_iq1_m  *) vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 8*il;
+-
+     const uint16_t * sc = (const uint16_t *)x[ibs].scales;
+-
+     iq1m_scale_t scale;
+-
+     scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+-
+     const int64_t ib16 = 2*ib + il/2; // sc[ib16/4] >> 3*(ib16%4) -> sc[ib/2] >> 3*((2*ib+il/2)%4);
+-
+     const float d = (float)scale.f16 * (2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1);
+-
+     const float delta = x[ibs].qh[2*ib+il/2] & (0x08 << 4*(il%2)) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
+-
+     uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+-
+     grid32[0] = iq1s_grid_gpu[x[ibs].qs[4*ib+il] | (((x[ibs].qh[2*ib+il/2] >> 4*(il%2)) & 7) << 8)];
+-
+     grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+-
+     grid32[0] &= 0x0f0f0f0f;
+-
+     for (int j = 0; j < 8; ++j) {
+-
+         y[j] = ggml_cuda_cast<dst_t>(d * (q[j] + delta));
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_iq4_nl * x = (const block_iq4_nl *) vx + ibs*(QK_K/QK4_NL);
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 4*il;
+-
+     const uint8_t  * q4 = x[ib].qs + 4*il;
+-
+     const float d = (float)x[ib].d;
+-
+     for (int j = 0; j < 4; ++j) {
+-
+         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
+-
+         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+-
+     const block_iq4_xs * x = (const block_iq4_xs *)vx;
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 4*il;
+-
+     const uint8_t  * q4 = x[ibs].qs + 16*ib + 4*il;
+-
+     const float d = (float)x[ibs].d * ((((x[ibs].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[ibs].scales_h >> 2*ib) & 3) << 4)) - 32);
+-
+     for (int j = 0; j < 4; ++j) {
+-
+         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
+-
+         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
+-
+     }
+-
+ }
+ 
+-
+-
+ template<typename dst_t>
+-
+ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+-
+-
+     const block_mxfp4 * x = (const block_mxfp4 *) vx + ibs*(QK_K/QK_MXFP4);
+ 
+-
+-
+     const int64_t il = tid/8; // 0...3
+-
+     const int64_t ib = tid%8; // 0...7
+-
+     dst_t * y = yy + 32*ib + 4*il;
+-
+     const uint8_t  * q4 = x[ib].qs + 4*il;
+-
+     const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+-
+     for (int j = 0; j < 4; ++j) {
+-
+         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
+-
+         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
+-
+     }
+-
+ }
+-
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index 5733fe9..6c1b15b 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -1,143 +1,73 @@
+ if (NOT EXISTS $ENV{ROCM_PATH})
+-
+     if (NOT EXISTS /opt/rocm)
+-
+         set(ROCM_PATH /usr)
+-
+     else()
+-
+         set(ROCM_PATH /opt/rocm)
+-
+     endif()
+-
+ else()
+-
+     set(ROCM_PATH $ENV{ROCM_PATH})
+-
+ endif()
+ 
+-
+-
+ list(APPEND CMAKE_PREFIX_PATH  ${ROCM_PATH})
+-
+ list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}/lib64/cmake")
+ 
+-
+-
+ if (NOT DEFINED CMAKE_HIP_FLAGS_DEBUG)
+-
+     set(CMAKE_HIP_FLAGS_DEBUG "-g -O2")
+-
+ endif()
+ 
+-
+-
+ # CMake on Windows doesn't support the HIP language yet
+-
+ if (WIN32)
+-
+     set(CXX_IS_HIPCC TRUE)
+-
+ else()
+-
+     string(REGEX MATCH "hipcc(\.bat)?$" CXX_IS_HIPCC "${CMAKE_CXX_COMPILER}")
+-
+ endif()
+ 
+-
+-
+ if (CXX_IS_HIPCC)
+-
+     if (LINUX)
+-
+         if (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
+-
+             message(WARNING "Only LLVM is supported for HIP, hint: CXX=/opt/rocm/llvm/bin/clang++")
+-
+         endif()
+ 
+-
+-
+         message(WARNING "Setting hipcc as the C++ compiler is legacy behavior."
+-
+                 " Prefer setting the HIP compiler directly. See README for details.")
+-
+     endif()
+-
+ else()
+-
+     # Forward (AMD)GPU_TARGETS to CMAKE_HIP_ARCHITECTURES.
+-
+     if(AMDGPU_TARGETS AND NOT GPU_TARGETS)
+-
+         set(GPU_TARGETS ${AMDGPU_TARGETS})
+-
+     endif()
+-
+     if(GPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
+-
+         set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
+-
+     endif()
+-
+     cmake_minimum_required(VERSION 3.21)
+-
+     enable_language(HIP)
+-
+ endif()
+ 
+-
+-
+ find_package(hip     REQUIRED)
+-
+ find_package(hipblas REQUIRED)
+-
+ find_package(rocblas REQUIRED)
+ 
+-
+-
+ if (GGML_HIP_RCCL)
+-
+     find_package(rccl REQUIRED)
+-
+ endif()
+ 
+-
+-
+ if (${hip_VERSION} VERSION_LESS 6.1)
+-
+     message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
+-
+ endif()
+ 
+-
+-
+ message(STATUS "HIP and hipBLAS found")
+ 
+-
+-
+ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
+-
+ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
+ 
+-
+-
+ file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+-
+ file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
+-
+ list(APPEND GGML_SOURCES_ROCM ${SRCS})
+-
+ file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+-
+ list(APPEND GGML_SOURCES_ROCM ${SRCS})
+-
+ file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
+-
+ list(APPEND GGML_SOURCES_ROCM ${SRCS})
+-
+ file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
+-
+ list(APPEND GGML_SOURCES_ROCM ${SRCS})
+ 
+ if (GGML_CUDA_FA_ALL_QUANTS)
+@@ -160,164 +90,84 @@ else()
+         ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu)
+ endif()
+ if (GGML_CUDA_FA_ALL_QUANTS)
+-
+     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
+-
+     list(APPEND GGML_SOURCES_ROCM ${SRCS})
+-
+     add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
+-
+ else()
+-
+     list(APPEND GGML_SOURCES_ROCM
+-
+         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
+-
+         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
+-
+         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
+ 
+         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+-
+ endif()
+ 
+-
+-
+ ggml_add_backend_library(ggml-hip
+-
+                          ${GGML_HEADERS_ROCM}
+-
+                          ${GGML_SOURCES_ROCM}
+-
+                         )
+ 
+-
+-
+ # TODO: do not use CUDA definitions for HIP
+-
+ if (NOT GGML_BACKEND_DL)
+-
+     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
+-
+ endif()
+ 
+-
+-
+ add_compile_definitions(GGML_USE_HIP)
+ 
+-
+-
+ if (GGML_CUDA_FORCE_MMQ)
+-
+     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+-
+ endif()
+ 
+-
+-
+ if (GGML_CUDA_FORCE_CUBLAS)
+-
+     add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+-
+ endif()
+ 
+-
+-
+ if (GGML_CUDA_NO_PEER_COPY)
+-
+     add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
+-
+ endif()
+ 
+-
+-
+ if (GGML_HIP_GRAPHS)
+-
+     add_compile_definitions(GGML_HIP_GRAPHS)
+-
+ endif()
+ 
+-
+-
+ if (GGML_HIP_NO_VMM)
+-
+     add_compile_definitions(GGML_HIP_NO_VMM)
+-
+ endif()
+ 
+-
+-
+ if (NOT GGML_HIP_MMQ_MFMA)
+-
+     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
+-
+ endif()
+ 
+-
+-
+ if (GGML_HIP_RCCL)
+-
+     add_compile_definitions(GGML_USE_NCCL) # RCCL has the same interface as NCCL.
+-
+ endif()
+ 
+-
+-
+ if (GGML_HIP_EXPORT_METRICS)
+-
+     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
+-
+ endif()
+ 
+-
+-
+ if (NOT GGML_CUDA_FA)
+-
+     add_compile_definitions(GGML_CUDA_NO_FA)
+-
+ endif()
+ 
+-
+-
+ if (CXX_IS_HIPCC)
+-
+     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
+-
+     if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+-
+         # CMake on Windows doesn't support the HIP language yet.
+-
+         # Therefore we workaround debug build's failure on HIP backend this way.
+-
+         set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES COMPILE_FLAGS "-O2 -g")
+-
+     endif()
+-
+     target_link_libraries(ggml-hip PRIVATE hip::device)
+-
+ else()
+-
+     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
+-
+ endif()
+ 
+-
+-
+ if (GGML_STATIC)
+-
+     message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
+-
+ endif()
+ 
+-
+-
+ if (GGML_HIP_RCCL)
+-
+     target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
+-
+ endif()
+ 
+-
+-
+ target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+-

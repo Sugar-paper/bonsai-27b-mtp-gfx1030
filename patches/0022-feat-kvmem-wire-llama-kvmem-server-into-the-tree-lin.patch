@@ -1,0 +1,373 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] feat(kvmem): wire llama-kvmem-server into the tree, links
+ clean on gfx1030
+
+The adapter was compiled but unreachable: llama-server has no kvmem code at
+all, and g_kvmem_params is only ever written by llama_kvmem_set_params(),
+which only the KVMem tools call. Add their targets here (upstream declares
+them in its superproject root, but this tree IS the llama.cpp tree):
+
+  tools/kvmem/CMakeLists.txt   llama-kvmem-server + llama-kvmem-cli
+  tools/CMakeLists.txt         add_subdirectory(kvmem) under LLAMA_KVMEM
+
+Two base-drift fixes were needed to get there:
+
+  * kvmem must be STATIC. This tree builds ggml/llama-common shared, so the
+    vendored add_library(kvmem ...) produced kvmem.dll with an empty export
+    table (no dllexport anywhere in libkvmem) and every kvmem:: symbol failed
+    to link into llama.dll. Upstream forces BUILD_SHARED_LIBS=OFF on Windows.
+
+  * kvmem-vision.cpp called mtmd_helper_init_opt_default(), which does not
+    exist in this tree: process_mtmd_prompt() is still the older
+    bool is_placeholder overload. Pass false (same "real tokens" semantics)
+    and include mtmd-helper.h explicitly, since this tree's server-common.h
+    does not re-export it the way the newer one does.
+
+Build result, build-hip, ROCm 7.1 / gfx1030:
+
+  llama-server.exe        NINJA_RC=0   282/282 targets
+  llama-kvmem-server.exe  NINJA_RC=0   1.86 MB
+
+llama-kvmem-server --help prints the full --kvmem* surface (budget,
+block-tokens, gen-reserve, method, query-*, mtp-state, gpu-ratio, cpu-gb,
+nvme-*, kv-dtype, -ctk/-ctv) and defaults to --kvmem on.
+
+Known gap, documented in docs/kvmem/FUSION-NOTES.md: kvmem_parse_cache_type()
+accepts only f16/f32/q8_0/q5_0/q4_0, so PrismML turbo3/turbo4 cannot be
+selected for the KV cache in the fused server yet.
+
+Also add docs/kvmem/FUSION-NOTES.md: the vendoring inventory, the 14-hunk
+conflict table, the HIP compat layer, the three Windows build traps and the
+exact build command.
+---
+ docs/kvmem/FUSION-NOTES.md   | 189 +++++++++++++++++++++++++++++++++++
+ kvmem/CMakeLists.txt         |   7 +-
+ tools/CMakeLists.txt         |   5 +
+ tools/kvmem/CMakeLists.txt   |  57 +++++++++++
+ tools/kvmem/kvmem-vision.cpp |  10 +-
+ 5 files changed, 266 insertions(+), 2 deletions(-)
+ create mode 100644 docs/kvmem/FUSION-NOTES.md
+ create mode 100644 tools/kvmem/CMakeLists.txt
+
+diff --git a/docs/kvmem/FUSION-NOTES.md b/docs/kvmem/FUSION-NOTES.md
+new file mode 100644
+index 0000000..c156425
+--- /dev/null
++++ b/docs/kvmem/FUSION-NOTES.md
+@@ -0,0 +1,189 @@
++# KVMem fusion notes
++
++How KVMem's tiered KV memory was fused into this PrismML + TurboQuant tree, what
++had to be adapted, and how to build it on this host.
++
++- Upstream: `https://github.com/kvmem/kvmem-llama.cpp` @ `485824c`, VERSION `0.16.0-rc3`
++- Vendored base: the patch is a cumulative diff against llama.cpp `b81c99b479d4c24e5eeca10de99032ebd343ef8f`
++- Branch: `kvmem-fusion`, started from `fusion-turboquant-on-prism` @ `5f5960b`
++
++KVMem is **not a fork**. It is an out-of-tree adapter: `llama.cpp` upstream is a
++submodule that the patch is applied to, and the adapter sources live beside it.
++The CMake contract is `-DLLAMA_KVMEM=ON -DLLAMA_KVMEM_ROOT=<kvmem root>`, where
++the root provides both `src/adapter/` and `kvmem/`.
++
++## What was brought in
++
++| Path | Contents |
++|---|---|
++| `src/adapter/` | 16 files, the integration layer. `llama-memory-kvmem.cpp` (143 KB) is the tiered store; `-mtp` and `-hybrid` are the MTP and hybrid-SSM variants |
++| `kvmem/` | Host-only portable library (`libkvmem`): store, runtime, raw store, RoPE. NVMe tier is POSIX-only and auto-disables on Windows |
++| `patches/kvmem/` | The upstream patch plus its historical predecessors, kept for provenance |
++| `tools/kvmem/` | KVMem's own server/CLI (`llama-kvmem-server.cpp`, `llama-kvmem-cli.cpp`), the KVMem-only headers and the lightweight web UI. **These are the only entry point to the adapter** — see below |
++| `tests/kvmem/`, `docs/kvmem/` | Upstream tests and design/milestone docs |
++
++## Patch replay
++
++`patches/kvmem/llama-kvmem-current.patch` touches 38 files (+734 / -152) and does
++**not** contain the adapter sources — those are a straight copy. 29 hunks applied
++clean; 14 collided with the prism branch and were resolved by hand.
++
++| File | Conflict | Resolution |
++|---|---|---|
++| `ggml/include/ggml.h` | clean | adds `GGML_OP_GATED_DELTA_NET_RECORD` |
++| `ggml/src/ggml.c` | name/symbol tables | added the two array entries; `GGML_OP_COUNT` had to go to **103**, because prism already carries `GGML_OP_TURBO_WHT` (the patch expected 102) |
++| `ggml/src/ggml-cpu/ggml-cpu.c` | 2 of 3 hunks | added the dispatch cases in the `n_tasks` and `ggml_graph_plan` switches |
++| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1 case | added the case to `ggml_cuda_supports_op`, sharing the `src[6]` guard with `GATED_DELTA_NET` |
++| `ggml/src/ggml-cpu/ops.cpp` | `K >= 1` / `K > 1` | `K >= 0` and `K != 1`: the RECORD op (K == 0) has no state output, so it uses the scratch slot |
++| `ggml/src/ggml-cuda/gated_delta_net.cu` | 2 hunks | guarded `state += state_out_offset` with `K > 0` so the pointer stays in bounds for RECORD. **Deliberately skipped** the second hunk's cosmetic refactor into `gdn_delta_f32`/`gdn_update_f32` — prism's kernel is column-sharded (`s_shard[c][r]`) and the upstream helper shape does not fit without rewriting it for no functional gain |
++| `src/llama-kv-cells.h` | field | added `llama_pos logical_pos = -1` to `llama_kv_cell_ext` |
++| `src/llama-kv-cache.cpp` | `ext` population | prism only sets `ext` for 2D positions. Widened the condition to `is_pos_2d() \|\| token \|\| logical_pos` and populate `ext.logical_pos` from `ubatch.logical_pos` (falling back to `pos`). KVMem reads this back as the cache row identity, so it must be written on every token batch |
++| `src/llama-memory-recurrent.cpp` | 4 hunks | replay scratch sizing (`REPLAY_COUNT` extra tensor rows when `replay`), `replay_l` resize, the five `gdn_record_*` tensors per layer, and `this->n_rs_seq` in the size log |
++| `src/models/delta-net-base.cpp` | 1 hunk | replay-aware `K = has_replay() ? (is_recording() ? 0 : 1) : n_rs_seq + 1`, the k/v/g/b record copies, and `K > 0` guards on the fused-node registration |
++
++## PrismML divergences fixed
++
++- **`llama_kv_cache` lost its `name_tag` parameter.** Upstream (and KVMem, which
++  builds a *second* cache and passes `"kvmem-mtp"`) rely on it so two caches in one
++  model do not collide on `cache_k_l0`. Restored as a defaulted trailing
++  `const char * name_tag = ""`, with naming back to `cache_%sk_l%d`.
++- **No PLE conv state / different `llama_memory_recurrent` shape.** The vendored
++  hunks assumed `hparams.ple_conv_state()`; prism has no PLE, so the scratch sizing
++  is `(2u + (replay ? REPLAY_COUNT : 0)) * n_layer * overhead`.
++
++## The stock server cannot switch KVMem on
++
++`src/llama-model.cpp` calls `llama_memory_kvmem_maybe_create()`, but that starts
++with `if (!g_kvmem_params.enabled) return nullptr;` — and `g_kvmem_params` is only
++ever written by `llama_kvmem_set_params()`, which **no llama.cpp tool calls**.
++`tools/server/` has zero `kvmem` references; the `--kvmem*` flags are parsed by a
++hand-rolled parser inside `tools/kvmem/llama-kvmem-server.cpp`. So with the stock
++`llama-server` the adapter is compiled in and dead.
++
++Upstream declares `llama-kvmem-server` / `llama-kvmem-cli` in its *superproject*
++root, where `llama.cpp` is a subdirectory. Here the fusion tree **is** the
++llama.cpp tree, so `tools/kvmem/CMakeLists.txt` was added and hooked into
++`tools/CMakeLists.txt` under `if (LLAMA_KVMEM)`.
++
++| Target | Sources | Links |
++|---|---|---|
++| `llama-kvmem-server` | `llama-kvmem-server.cpp`, `kvmem-spec.cpp`, `kvmem-vision.cpp`, `tools/server/server-common.cpp` | `llama llama-common cpp-httplib mtmd` |
++| `llama-kvmem-cli` | `llama-kvmem-cli.cpp`, `kvmem-spec.cpp` | `llama llama-common` |
++
++Verified surface (`llama-kvmem-server --help`): `--kvmem` / `--no-kvmem`
++(**default on**), `--kvmem-budget`, `--kvmem-block-tokens`, `--kvmem-sink-tokens`,
++`--kvmem-gen-reserve`, `--kvmem-recent-tokens`, `--kvmem-method`,
++`--kvmem-query-*`, `--kvmem-mtp-state`, `--kvmem-gpu-ratio`, `--kvmem-cpu-gb`,
++`--kvmem-nvme-gb|dir`, `--kvmem-harvest-v`, `--kvmem-raw-k-nvme`, `--kv-dtype`,
++`-ctk/-ctv`, `--spec-type draft-mtp`, `--spec-draft-n-max`.
++
++## Base drift (the tree is 437 commits behind)
++
++Two things assumed by the vendored sources exist only in the pinned base
++`b81c99b`, not here:
++
++1. **`kvmem/CMakeLists.txt` had to go `STATIC`.** Upstream sets
++   `BUILD_SHARED_LIBS=OFF` on Windows; this tree builds ggml/llama-common shared,
++   so `add_library(kvmem ...)` produced `kvmem.dll` with an **empty export table**
++   (libkvmem carries no `__declspec(dllexport)`), and every `kvmem::` symbol failed
++   to link into `llama.dll`. Static is also what upstream effectively gets on Linux.
++2. **`tools/kvmem/kvmem-vision.cpp`.** Newer `process_mtmd_prompt()` takes an
++   `mtmd_helper_init_opt` object; this tree still takes `bool is_placeholder`, so
++   `mtmd_helper_init_opt_default()` was replaced with `false` (same "real tokens"
++   semantics). It also had to include `mtmd-helper.h` explicitly, because the newer
++   `server-common.h` re-exports it and this one does not.
++
++## HIP / ROCm
++
++KVMem's GPU stage-in (`llama-kvmem-stagein.cu`, 1073 lines, 10 kernels) is
++CUDA-only, and there is **no host fallback implementation** — the adapter calls the
++26 `kvmem_stagein_*` symbols unconditionally, so a build without that translation
++unit fails to link.
++
++The CUDA surface actually used is tiny and hip-compatible: 25 host runtime entry
++points, `<<<>>>` launches, `__global__`, `blockIdx`/`threadIdx`/`blockDim`. No
++`__shfl_*`, no `atomicAdd`, no `__ldg`, no textures. So instead of forking the
++source, `src/adapter/llama-kvmem-cuda-compat.h` maps the CUDA names onto HIP.
++
++Two names have no HIP equivalent and are declared in the shim:
++
++| CUDA | HIP |
++|---|---|
++| `__nv_bfloat16` | `__hip_bfloat16` |
++| `half` | `__half` |
++
++`cudaPointerAttributes` maps to `hipPointerAttribute_t` (HIP spells it singular).
++
++Include sites routed through the shim: `llama-kvmem-stagein.cu`,
++`llama-kvmem-transfer.h`, `llama-memory-kvmem.cpp`, `llama-memory-kvmem-mtp.cpp`.
++
++## Building on this host
++
++Environment is the same as `F:\AI\llama-stack\scripts\build-prismml-fusion-hip.bat`.
++Three traps are worth knowing:
++
++1. **Do not call `enable_language(HIP)`.** On Windows `ggml/src/ggml-hip/CMakeLists.txt`
++   sets `CXX_IS_HIPCC` unconditionally ("CMake on Windows doesn't support the HIP
++   language") and compiles `../ggml-cuda/*.cu` as **CXX** with the ROCm `clang++`,
++   which puts `.cu` files into HIP mode by extension. The stage-in follows the same
++   path. Enabling the HIP language instead makes CMake 4.2.3 write an unescaped
++   `HIP_PATH` into `CMakeHIPCompiler.cmake` (`Invalid character escape '\P'`), and
++   without a pre-set `CMAKE_HIP_ARCHITECTURES` it fails earlier with "Failed to find
++   a default HIP architecture".
++2. **`hip::host` / `hip::device` are directory-scoped IMPORTED targets.**
++   `ggml-hip` is a sibling of `src/`, so `src/CMakeLists.txt` has to repeat
++   `find_package(hip REQUIRED)`. `hip_DIR` is already cached, so it resolves instantly.
++3. **`lld-link.exe` and `lld.exe` are missing from `C:\Program Files\AMD\ROCm\7.1\bin\`**
++   (security software removes them; `ld.lld.exe` survives). LLD is a multi-call
++   binary, so copy `ld.lld.exe` to both names under
++   `F:\AI\llama-stack\temp_clean_later\toolchain\lld-compat\` and prepend that
++   directory to `PATH`. Without it any *new* `.cu` fails with
++   `unable to execute command: program not executable` / `amdgcn-link command failed`.
++   Existing object files mask the problem because ninja does not rebuild them.
++
++```bash
++# after exporting the ROCm/MSVC environment and the lld-compat PATH
++cmake -S <this tree> -B <this tree>/build-hip \
++      -DLLAMA_KVMEM=ON -DLLAMA_KVMEM_ROOT=<this tree>
++ninja -j 16 llama-server        # NOT `ninja all`
++ninja -j 16 llama-kvmem-server  # the one that can actually turn KVMem on
++```
++
++`kvmem/CMakeLists.txt` adds five test executables unconditionally, so `ninja all`
++will drag them in; build concrete targets instead.
++
++The whole thing is wrapped in `F:\AI\llama-stack\scripts\build-prismml-fusion-hip.bat`,
++which now also prepends the lld-compat directory and passes `-DLLAMA_KVMEM=ON`.
++
++## Status
++
++- Configure: green. `libkvmem` (static), the five adapter objects and
++  `llama-kvmem-stagein.cu.obj` are all in the ninja graph.
++- Compile: 10/10 kvmem objects, 0 errors, against the prism tree.
++- **`llama-server.exe`: links, `NINJA_RC=0`, 282/282 targets.**
++- **`llama-kvmem-server.exe`: links (1.86 MB).** Runs; `--help` prints the full
++  `--kvmem*` surface, so the adapter is reachable from the command line.
++- Device enumeration could not be checked in-sandbox: `--list-devices` reports
++  "no ROCm-capable device is detected" for the *pre-existing* `llama-server.exe`
++  and `llama-cli.exe` too, i.e. the sandbox has no GPU access. Must be re-checked
++  from the user's own terminal.
++
++## Not done
++
++- **`turbo3` / `turbo4` are not accepted as KV cache types by the KVMem tools.**
++  `kvmem_parse_cache_type()` (`tools/kvmem/kvmem-spec.cpp`) allows only
++  `f16|f32|q8_0|q5_0|q4_0`, and `kvmem_cache_types_ok()` gates quantized types to
++  `{q8_0, q5_0, q4_0}`. PrismML's TurboQuant cache types therefore cannot be
++  selected in the fused server, even though the kernel side would accept them:
++  `kvmem_cache_pack_rows()` falls through to `ggml_quantize_chunk()` for any
++  quantized type. Making this work needs (a) the two allow-lists extended and
++  (b) a check that the turbo block layout survives KVMem's
++  pack/unpack/`to_float` round trip. This is the open decision.
++- KVMem's lightweight web UI (`tools/kvmem/ui/`) is served from `--ui-dir`; the
++  bundled copy in `kvmem-webui.h` is what actually ships.
++- Five `kvmem_*_test` executables are defined by `kvmem/CMakeLists.txt` but are
++  not part of the normal build (`ninja all` would pull them in).
++- The non-Windows HIP path fails with an explicit `FATAL_ERROR`. It would need the
++  HIP language enabled at the project root.
++- `ggml/include/ggml-rpc.h` asserts `GGML_OP_COUNT == 101`. It was already stale at
++  102 before this work; bumping it means deciding an `RPC_PROTO_PATCH_VERSION` bump.
+diff --git a/kvmem/CMakeLists.txt b/kvmem/CMakeLists.txt
+index 648ac81..3e5dfbb 100644
+--- a/kvmem/CMakeLists.txt
++++ b/kvmem/CMakeLists.txt
+@@ -8,7 +8,12 @@ if (WIN32 AND KVMEM_ENABLE_NVME)
+     message(FATAL_ERROR "NVMe storage is not supported on Windows; use KVMEM_ENABLE_NVME=OFF")
+ endif()
+ 
+-add_library(kvmem
++# STATIC on purpose. Upstream forces BUILD_SHARED_LIBS=OFF on Windows; this tree
++# builds the rest of llama.cpp shared (ggml/llama-common/... are DLLs), and
++# libkvmem carries no export annotations, so a shared build produces a kvmem.dll
++# with an empty export table and every kvmem:: symbol fails to link into llama.
++# libkvmem is only ever linked into libllama, so static is also the cheaper choice.
++add_library(kvmem STATIC
+     src/host/kvmem_store.cpp
+     src/host/kvmem_runtime.cpp
+     src/host/raw_kv_store.cpp
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index da1b2bc..5e1bd03 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -30,6 +30,11 @@ else()
+     add_subdirectory(tokenize)
+     add_subdirectory(tts)
+     add_subdirectory(mtmd)
++    if (LLAMA_KVMEM)
++        # KVMem's own server/CLI. Only these can switch the adapter on; see
++        # tools/kvmem/CMakeLists.txt.
++        add_subdirectory(kvmem)
++    endif()
+     if (GGML_RPC)
+         add_subdirectory(rpc)
+     endif()
+diff --git a/tools/kvmem/CMakeLists.txt b/tools/kvmem/CMakeLists.txt
+new file mode 100644
+index 0000000..c791166
+--- /dev/null
++++ b/tools/kvmem/CMakeLists.txt
+@@ -0,0 +1,57 @@
++# KVMem's own server and CLI.
++#
++# These are NOT optional extras: the stock llama-server has no idea KVMem
++# exists. The tiered store is switched on by llama_kvmem_set_params() before
++# llama_init_from_model, and the --kvmem* flags are parsed by these two tools
++# (hand-rolled parser, not common/arg.cpp). So this is the only binary pair
++# through which the fused adapter is actually reachable.
++#
++# Upstream (kvmem-llama.cpp) declares these targets in its superproject root,
++# where llama.cpp is a subdirectory. Here the fusion tree *is* the llama.cpp
++# tree, so they are declared beside the other tools instead.
++
++if (NOT LLAMA_KVMEM)
++    return()
++endif()
++
++set(_kvmem_tools ${CMAKE_CURRENT_SOURCE_DIR})
++
++# llama-kvmem-server: KVMem's drop-in replacement for tools/server.
++# server-common.cpp is compiled here as well -- upstream does the same, and in
++# this tree it carries the KVMem-aware request plumbing added by the patch.
++add_executable(llama-kvmem-server
++    ${_kvmem_tools}/llama-kvmem-server.cpp
++    ${_kvmem_tools}/kvmem-spec.cpp
++    ${_kvmem_tools}/kvmem-vision.cpp
++    ${CMAKE_SOURCE_DIR}/tools/server/server-common.cpp)
++
++target_include_directories(llama-kvmem-server PRIVATE
++    ${_kvmem_tools}
++    ${LLAMA_KVMEM_ROOT}/src/adapter
++    ${CMAKE_SOURCE_DIR}/include
++    ${CMAKE_SOURCE_DIR}/common
++    ${CMAKE_SOURCE_DIR}/tools/server
++    ${CMAKE_SOURCE_DIR}/tools/mtmd
++    ${CMAKE_SOURCE_DIR}/vendor
++    ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
++
++target_link_libraries(llama-kvmem-server PRIVATE llama llama-common cpp-httplib mtmd)
++target_compile_features(llama-kvmem-server PRIVATE cxx_std_17)
++target_compile_definitions(llama-kvmem-server PRIVATE
++    KVMEM_ENABLE_NVME=$<BOOL:${KVMEM_ENABLE_NVME}>)
++
++# llama-kvmem-cli: single-shot decoder with the same --kvmem* surface.
++add_executable(llama-kvmem-cli
++    ${_kvmem_tools}/llama-kvmem-cli.cpp
++    ${_kvmem_tools}/kvmem-spec.cpp)
++
++target_include_directories(llama-kvmem-cli PRIVATE
++    ${_kvmem_tools}
++    ${LLAMA_KVMEM_ROOT}/src/adapter
++    ${CMAKE_SOURCE_DIR}/include
++    ${CMAKE_SOURCE_DIR}/common)
++
++target_link_libraries(llama-kvmem-cli PRIVATE llama llama-common)
++target_compile_features(llama-kvmem-cli PRIVATE cxx_std_17)
++target_compile_definitions(llama-kvmem-cli PRIVATE
++    KVMEM_ENABLE_NVME=$<BOOL:${KVMEM_ENABLE_NVME}>)
+diff --git a/tools/kvmem/kvmem-vision.cpp b/tools/kvmem/kvmem-vision.cpp
+index 45fd5b5..7f5fe4c 100644
+--- a/tools/kvmem/kvmem-vision.cpp
++++ b/tools/kvmem/kvmem-vision.cpp
+@@ -1,6 +1,10 @@
+ #include "llama-kvmem-diag.h"
+ #include "kvmem-vision.h"
+ #include "server-common.h"
++// Upstream (newer base) gets the mtmd helper API through server-common.h. This
++// tree's server-common.h only pulls in mtmd.h, so include it explicitly:
++// mtmd_helper_decode_image_chunk_with_decoder comes from the KVMem patch.
++#include "mtmd-helper.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -102,7 +106,11 @@ kvmem_vision::~kvmem_vision() { mtmd_free(ctx_); }
+ 
+ std::shared_ptr<kvmem_prompt> kvmem_vision::tokenize(const std::string & prompt,
+                                                  const std::vector<std::vector<uint8_t>> & files) {
+-    auto native = std::make_shared<server_tokens>(process_mtmd_prompt(ctx_, prompt, files, mtmd_helper_init_opt_default()));
++    // Base drift: upstream's process_mtmd_prompt() takes an mtmd_helper_init_opt
++    // object (mtmd_helper_init_opt_default()). This tree is 437 commits behind and
++    // still takes `bool is_placeholder`; false is the same "real tokens, not a
++    // placeholder count" call the default opt produces.
++    auto native = std::make_shared<server_tokens>(process_mtmd_prompt(ctx_, prompt, files, false));
+     return std::make_shared<kvmem_prompt>(std::move(native));
+ }
+ 

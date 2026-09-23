@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): scope is Bonsai-2-27B, and the stack is green
+ for it
+
+The stack only needs to serve Ternary-Bonsai-2-27B, which changes what the KV
+defects above mean: the launcher passes -ngl 99 -fa on -c 32768 but no -ctk/-ctv,
+so the model runs on the default f16 KV cache, and f16 x f16 measured healthy in
+every configuration. So none of those defects apply here. They stay recorded as
+upstream / PrismML bug reports, not as blockers.
+
+The one thing that did matter was the build configuration, and since FA_ALL_QUANTS
+was flipped on this build dir the target model was re-validated rather than assumed:
+
+  llama-bench -p 512 -n 32 -ngl 99 -fa 1 -r 3
+    fusion, FA_ALL_QUANTS=OFF      317.65 prompt / 45.70 gen t/s
+    original PrismML, ON           316.44 / 46.13        -> parity inside noise
+
+  coherence, greedy: Paris; 17*23 -> 391; a code request planned correctly
+
+The launcher itself was exercised too, because that is the real entry point:
+--list enumerates ROCm0, and --cli forwards a quoted prompt intact and gets a
+coherent answer - which doubles as a regression test for the two .bat hazards
+(no shift inside a parenthesised block, %2..%9 so quotes survive).
+
+All four PQ2_0 variants were run as well: 43.7-44.2 t/s, coherent, no crashes.
+
+state.json now carries scope and lastValidation, and portStatus says what is true:
+complete and green for the target model.
+---
+ fusion/state.json           | 18 ++++++++-
+ fusion/upstream-sync-log.md | 81 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+), 2 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index d5f9a01..5e29b76 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -44,7 +44,7 @@
+       "scope": "integration layer: CLI, FA dispatch, convert tables, set-rows, graph rotations, CPU path, quantize_chunk, ggml_turbo_wht declaration, llama-bench names, tests"
+     }
+   ],
+-  "portStatus": "complete-for-gpu-and-cpu-cache-types",
++  "portStatus": "complete-and-green-for-the-target-model-bonsai-2-27b",
+   "verification": {
+     "build": "BUILD_OK, ROCm 7.1 clang + Ninja, gfx1030, GGML_HIP_MMQ_MFMA=ON, GGML_HIP_NO_VMM=ON, GGML_CUDA_FA_ALL_QUANTS=ON",
+     "cliAcceptsCacheTypes": "llama-server --help now lists turbo3, turbo4 (it did not before)",
+@@ -198,11 +198,25 @@
+     "gpuArchitecture": "gfx1030",
+     "rocm": "7.1"
+   },
+-  "updatedAt": "2026-09-19T18:05:00+08:00",
++  "updatedAt": "2026-09-19T18:15:00+08:00",
+   "buildRecommendation": {
+     "faAllQuants": "OFF. See knownDefects[0]: turning it on corrupts quantized-V attention for most combinations.",
+     "hipGraphs": "GGML_HIP_GRAPHS is present in this worktree's CMakeCache but is not wired into build.ninja at all, so the option is inert here. Not a factor either way.",
+     "turboInstances": "The TurboQuant FA vec instances are in the explicit CMake list, so they are compiled with FA_ALL_QUANTS=OFF too.",
+     "tests": "This build dir has LLAMA_BUILD_TESTS=ON for the ctest gate, so a bare ninja tries to compile PrismML's test-dspark-forward.cpp, which does not build on Windows (setenv). Build named targets."
++  },
++  "scope": {
++    "targetModel": "Ternary-Bonsai-2-27B (PrismML ternary PQ2_0, qwen35 arch, head_dim 256)",
++    "launcher": "<MODELS>/Bonsai-2-27B/start-bonsai.bat",
++    "kvConfig": "The launcher does not pass -ctk/-ctv, so the model runs on the default f16 KV cache.",
++    "consequence": "f16 x f16 is healthy in every configuration measured, so the KV defects in knownDefects do not apply to this stack. They are recorded as upstream / PrismML bug reports, not blockers."
++  },
++  "lastValidation": {
++    "date": "2026-09-19",
++    "after": "flipping GGML_CUDA_FA_ALL_QUANTS to OFF",
++    "bench": "-p 512 -n 32 -ngl 99 -fa 1 -r 3 -> 317.65 prompt / 45.70 gen t/s, against 316.44 / 46.13 on the original PrismML build",
++    "coherence": "capital -> Paris; 17*23 -> 391; a code request is planned correctly",
++    "launcher": "start-bonsai.bat --list enumerates ROCm0; --cli forwards a quoted prompt intact and answers coherently",
++    "recordPath": "<STACK>/temp_clean_later/bench-results/bonsai-revalidate"
+   }
+ }
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+index f19af8d..d7ee67a 100644
+--- a/fusion/upstream-sync-log.md
++++ b/fusion/upstream-sync-log.md
+@@ -445,3 +445,84 @@ Records: `temp_clean_later/bench-results/prism-graphs-off-build`,
+ corrupts quantized-V attention for every combination except identical quantized K and
+ V. The llama.cpp fusion already builds with it OFF plus an explicit combination list,
+ which is the configuration that has been behaving.
++
++## 2026-09-19 (scope): this stack exists for Bonsai-2-27B, and it is green
++
++Stated scope: the PrismML fusion only has to serve **Ternary-Bonsai-2-27B**. That
++settles how much the KV defects above matter, and the answer is: not much.
++
++`F:\AI\lm-models\Bonsai-2-27B\start-bonsai.bat` launches with
++
++```text
++-ngl 99 -fa on -c 32768 --jinja --cache-prompt --cont-batching --parallel 1
++```
++
++and **does not pass `-ctk`/`-ctv`**, so the model runs on the **default f16 KV
++cache**. f16 x f16 is the one combination that measured healthy in every
++configuration tested today:
++
++| | FA_ALL_QUANTS ON | OFF |
++| --- | --- | --- |
++| f16 x f16 | 6.9921 | 6.9921 |
++
++So none of the KV defects apply to this model, and they are recorded as upstream /
++PrismML bug reports rather than as blockers here. The one thing that did matter is
++the build configuration, and it is settled: **FA_ALL_QUANTS=OFF**.
++
++### Re-validation after the build-config change
++
++Changing the build option changed the binary the launcher points at, so the target
++model was re-measured rather than assumed.
++
++`llama-bench -p 512 -n 32 -ngl 99 -fa 1 -r 3`, Ternary-Bonsai-2-27B-PQ2_0:
++
++| build | prompt tok/s | generation tok/s |
++| --- | --- | --- |
++| fusion, FA_ALL_QUANTS=OFF | **317.65** | **45.70** |
++| original PrismML, FA_ALL_QUANTS=ON | 316.44 | 46.13 |
++
++Parity inside run-to-run noise, as expected: f16 KV selects the same instance
++either way.
++
++Coherence, greedy, `-fa on -ngl 99`:
++
++```text
++"The capital of France is"               -> [Start thinking] ... Final: Paris. [End thinking]  Paris
++"what is 17 * 23?"                       -> 17*20=340, 17*3=51 total 391
++"Write a Python function that reverses a string..." -> plans the function and the comment
++```
++
++All three correct, including the arithmetic.
++
++### The launcher itself
++
++Both branches of `start-bonsai.bat` were exercised, since that file is the actual
++entry point:
++
++```text
++start-bonsai.bat --list                       -> ROCm0: AMD Radeon RX 6900 XT (16368 MiB, 16226 MiB free)
++start-bonsai.bat --cli -p "The capital ..."   -> prompt forwarded intact, model answers coherently
++```
++
++The second one is the regression test for the two .bat hazards recorded in the
++skill: no `shift` inside a parenthesised block, and `%2..%9` rather than `%~2..` so
++quotes survive. A quoted prompt arriving intact means both hold.
++
++The banner in the header was stale (`build b2-c6fbb78`) and now records the code
++commit and the FA_ALL_QUANTS=OFF configuration.
++
++Records: `temp_clean_later/bench-results/bonsai-revalidate`.
++
++### All four Bonsai variants
++
++The launcher defaults to one of them, but four are on disk and all are the same
++format, so they were all run (greedy, `-ngl 99 -fa 1 -c 2048`):
++
++| model | rc | generation tok/s | answer |
++| --- | --- | --- | --- |
++| Ternary-Bonsai-2-27B-PQ2_0 | 0 | 43.7 | plans, answers Paris |
++| Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0 | 0 | 44.0 | same |
++| TERNARY-BONSAI-2-27B-DERISKED-PQ2_0 | 0 | 44.0 | same |
++| Bonsai-2-27B-PQ2_0-CRACK | 0 | 44.2 | same |
++
++No crashes, no format differences, no variant-specific behaviour.

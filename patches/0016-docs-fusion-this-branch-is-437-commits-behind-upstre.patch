@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): this branch is 437 commits behind upstream
+ master, and that is not ours to fix
+
+Measured 2026-09-19: upstream master is 1af554f8f; this tree sits on PrismML's prism
+fork (9a9394a) whose merge-base is 5ea87ddad (2026-08-25, b10615-1), so it is 437
+commits behind master - 36 in ggml-cuda, 17 in ggml-cpu, 76 in src/, 36 in common/ -
+and 430 behind the b11046 branch's own base.
+
+No upstream rebase here: prism is PrismML's branch and its 93 own commits are the
+point of it. The lever we control is the forward port of the private types onto newer
+upstream (see consolidationIfWanted), or simply tracking PrismML releases.
+---
+ fusion/state.json | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index 585a7b0..25ad8ff 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -373,5 +373,26 @@
+     "movedWith": "temp_clean_later/scripts/restructure-bonsai-layout.py (same-volume renames only, sizes verified, idempotent)",
+     "open": "no mmproj-*.gguf is present, so the vision tower is unavailable. The upstream repo ships it; LM Studio would auto-pair an mmproj file placed in the same repo folder.",
+     "date": "2026-09-19"
++  },
++  "upstreamCurrency": {
++    "measuredAt": "2026-09-19 20:5x +08:00",
++    "officialMaster": {
++      "commit": "1af554f8fc78ba029665a47b839484d9763e2a75",
++      "date": "2026-09-19 15:37 +0300",
++      "subject": "server : improve startup log messages (#29125)",
++      "how": "git ls-remote origin refs/heads/master, then fetched into a temp ref and counted with rev-list"
++    },
++    "verdict": "NOT at upstream master",
++    "pinnedTo": "PrismML prism branch 9a9394a; merge-base with upstream master is 5ea87ddad (2026-08-25, b10615-1)",
++    "commitsBehindMaster": 437,
++    "breakdown": {
++      "ggml-cuda": 36,
++      "ggml-cpu": 17,
++      "src/": 76,
++      "common/": 36
++    },
++    "alsoBehindOwnSibling": "430 commits behind the b11046 fusion base, on top of which that tree is 7 behind master",
++    "upgradeCost": "not ours to change unilaterally - this is PrismML fork/prism; upgrading the base means rebasing their 93 own commits. The lever we control is the forward port of their private types onto a newer upstream (see consolidationIfWanted), or tracking their releases.",
++    "recommendation": "do not attempt an upstream rebase here. Track PrismML releases and, if the ternary model needs newer upstream, port the private types forward instead."
+   }
+ }

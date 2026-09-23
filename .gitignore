@@ -1,0 +1,12 @@
+# Release assets are uploaded to the GitHub/Gitea Release, not committed.
+assets/*.zip
+
+# local verification scratch
+_verify_extract/
+__pycache__/
+*.pyc
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,439 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bonsai-27b-fusion <noreply@users.noreply.github.com>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] docs(fusion): the KV defects were one line we dropped, and
+ they are withdrawn
+
+Both defect entries are replaced by one resolved entry (41d8f6c) plus an explicit
+corrections block, because both were symptoms of the same lost line rather than
+independent findings:
+
+- fa-all-quants-on-corrupts-quantized-v-attention: withdrawn. ON is healthy
+  (f16/q8_0 6.9579, q4_0/q8_0 6.9944, q8_0/q8_0 6.9397, all inside noise against
+  f16/f16 6.9921), and the recommendation to build with it off is withdrawn too.
+- q8_0-kv-pair-broken-on-prism-base: withdrawn. Our port introduced it; the line is
+  present in 9a9394a and in the b11046 replay. Nothing to report to PrismML.
+- The claim "dequantize_q8_0 is byte-identical to upstream" was the assertion that
+  kept the one file that differed closed. It is recorded as false, with the reason.
+
+Also records the post-fix op gate (2936/2936 OFF, 3949/3949 ON), the full K/V matrix
+on both configurations, the target-model re-validation on both, and the audit that
+should have caught this: scripts/audit-port-deletions.py, 14 non-blank deletions on
+this branch (13 deliberate, 1 lost) against 14 on the b11046 replay (all deliberate).
+
+turbo-kv-broken-at-head-dim-128 is downgraded to "unproven, not re-measurable here":
+its head_dim 128 numbers were taken on the broken build and its q8_0 control was
+itself defective, and no head_dim 128 model is on disk any more.
+---
+ fusion/state.json           | 214 ++++++++++++++++++++++++------------
+ fusion/upstream-sync-log.md | 144 ++++++++++++++++++++++++
+ 2 files changed, 285 insertions(+), 73 deletions(-)
+
+diff --git a/fusion/state.json b/fusion/state.json
+index 5e29b76..364ba64 100644
+--- a/fusion/state.json
++++ b/fusion/state.json
+@@ -46,7 +46,7 @@
+   ],
+   "portStatus": "complete-and-green-for-the-target-model-bonsai-2-27b",
+   "verification": {
+-    "build": "BUILD_OK, ROCm 7.1 clang + Ninja, gfx1030, GGML_HIP_MMQ_MFMA=ON, GGML_HIP_NO_VMM=ON, GGML_CUDA_FA_ALL_QUANTS=ON",
++    "build": "BUILD_OK, ROCm 7.1 clang + Ninja, gfx1030, GGML_HIP_MMQ_MFMA=ON, GGML_HIP_NO_VMM=ON, GGML_CUDA_FA_ALL_QUANTS=ON (was OFF when the pre-fix matrix was taken)",
+     "cliAcceptsCacheTypes": "llama-server --help now lists turbo3, turbo4 (it did not before)",
+     "bench": {
+       "model": "qwen2.5-1.5b-instruct-q8_0",
+@@ -114,76 +114,76 @@
+       "temp_clean_later/bench-results/prism-fusion-verify",
+       "temp_clean_later/bench-results/prism-baseline-kv",
+       "temp_clean_later/bench-results/sc117-turbo-kv-reality"
+-    ]
+-  },
+-  "knownDefects": [
+-    {
+-      "id": "fa-all-quants-on-corrupts-quantized-v-attention",
+-      "severity": "high",
+-      "scope": "build configuration, not code. Any tree built with GGML_CUDA_FA_ALL_QUANTS=ON.",
+-      "summary": "Building with GGML_CUDA_FA_ALL_QUANTS=ON corrupts attention for every quantized-V combination except identical quantized K and V. Turning it off fixes f16K x q8_0V (92.5372 -> 6.9735), q4_0K x q8_0V (88.6076 -> 7.0127) and leaves the rest healthy.",
+-      "evidence": {
+-        "build": "this worktree's build-hip, reconfigured with -DGGML_CUDA_FA_ALL_QUANTS=OFF; the reconfigure was verified to have landed (cache shows OFF, the define is gone from build.ninja, rebuild took 330 s rather than a no-op 26 s)",
+-        "matrix": {
+-          "f16K_f16V": {
+-            "on": 6.9921,
+-            "off": 6.9921
+-          },
+-          "f16K_q8_0V": {
+-            "on": 92.5372,
+-            "off": 6.9735
+-          },
+-          "q8_0K_f16V": {
+-            "on": 7.3955,
+-            "off": 6.9691
+-          },
+-          "q4_0K_q4_0V": {
+-            "on": 7.014,
+-            "off": 7.014
+-          },
+-          "q4_0K_q8_0V": {
+-            "on": 88.6076,
+-            "off": 7.0127
+-          },
+-          "q8_0K_q4_0V": {
+-            "on": 7.4975,
+-            "off": 6.9937
+-          },
+-          "q8_0K_q8_0V": {
+-            "on": 92.2627,
+-            "off": 92.2627
+-          }
++    ],
++    "postFix": {
++      "date": "2026-09-19",
++      "commit": "41d8f6c",
++      "opLevel": {
++        "test-backend-ops -o FLASH_ATTN_EXT": {
++          "FA_ALL_QUANTS_OFF": "2936/2936 passed",
++          "FA_ALL_QUANTS_ON": "3949/3949 passed"
++        },
++        "before": "2629/2936, the 307 failures were all q8_0 x q8_0"
++      },
++      "kvMatrixSC117HeadDim256": {
++        "settings": "-c 512 -fa 1 --chunks 8 -ngl 999, wiki.test.raw",
++        "FA_ALL_QUANTS_OFF": {
++          "f16/f16": 6.9921,
++          "f16/q8_0": 6.9735,
++          "q8_0/f16": 6.9691,
++          "q8_0/q8_0": 6.9397,
++          "q4_0/q4_0": 7.014,
++          "q4_0/q8_0": 7.0127,
++          "q8_0/q4_0": 6.9937,
++          "turbo3/turbo3": 7.1292,
++          "turbo4/turbo4": 7.0756,
++          "f16/turbo3": 7.0622,
++          "turbo3/f16": 7.0439
++        },
++        "FA_ALL_QUANTS_ON": {
++          "f16/f16": 6.9921,
++          "f16/q8_0": 6.9579,
++          "q8_0/f16": 6.9824,
++          "q8_0/q8_0": 6.9397,
++          "q4_0/q4_0": 7.014,
++          "q4_0/q8_0": 6.9944,
++          "q8_0/q4_0": 6.9985,
++          "turbo3/turbo3": 7.1292,
++          "turbo4/turbo4": 7.0756
++        },
++        "verdict": "every cell is 6.94-7.13, and the spread between the two build configurations is inside run-to-run noise. Correctness no longer depends on GGML_CUDA_FA_ALL_QUANTS."
++      },
++      "targetModel": {
++        "model": "Ternary-Bonsai-2-27B-PQ2_0",
++        "bench": {
++          "FA_ALL_QUANTS_OFF": "317.22 / 45.72 tok/s",
++          "FA_ALL_QUANTS_ON": "317.15 / 45.99 tok/s",
++          "originalPrismMLBuild": "316.14 / 45.87 and 317.23 / 46.02 on the two runs"
+         },
++        "coherence": "capital -> Paris; 17*23 -> 391; the code request plans a function and a comment - correct on both configurations",
+         "recordPaths": [
+-          "temp_clean_later/bench-results/prism-fa-allquants-off",
+-          "temp_clean_later/bench-results/prism-fusion-kv-quadrant"
++          "temp_clean_later/bench-results/bonsai-revalidate-postq8fix",
++          "temp_clean_later/bench-results/bonsai-revalidate-postq8fix-on"
+         ]
+       },
+-      "correction": "This also corrects the previous entry's 'whenever V is q8_0 the result is garbage'. That was true under the option this build uses; with the option off, V=q8_0 is fine against K=f16 and K=q4_0.",
+-      "recommendation": "Do not build a PrismML-based tree with GGML_CUDA_FA_ALL_QUANTS=ON. The llama.cpp fusion builds with it OFF plus an explicit combination list, which is the configuration that has been behaving."
+-    },
+-    {
+-      "id": "q8_0-kv-pair-broken-on-prism-base",
+-      "severity": "medium",
+-      "scope": "PrismML's base, both build configurations, both head sizes. The only pairing that fails.",
+-      "summary": "q8_0 K with q8_0 V gives PPL 92.2627 (both build configurations) against 6.9921 for f16, with byte-identical per-chunk values, so it is one deterministic code path.",
+-      "checked": [
+-        "The FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0) case IS declared, in both branches of the option switch - the chooser finds it.",
+-        "dequantize_q8_0 in dequantize.cuh is byte-identical to upstream's.",
+-        "fattn-vec.cuh, fattn-common.cuh, fattn-tile.cuh and fattn.cu were not touched by any of PrismML's 93 own commits.",
+-        "The llama.cpp base runs q8_0 x q8_0 correctly at both head sizes: 10.7160 at 128, 6.9397 at 256.",
+-        "Not the head size, not the TurboQuant port, not the mean-centering or the attention rotation."
+-      ],
+-      "nextStep": "Kernel level rather than configuration level. Perplexity exercises BEST_FATTN_KERNEL_TILE, so start there and compare against upstream at the merge-base, then bisect PrismML's own commits if the merge-base is clean."
+-    },
++      "recordPaths": [
++        "temp_clean_later/bench-results/post-fix-kv-matrix",
++        "temp_clean_later/bench-results/prism-fa-allquants-on-postfix",
++        "temp_clean_later/bench-results/prism-fa-allquants-off-postfix"
++      ]
++    }
++  },
++  "knownDefects": [
+     {
+       "id": "turbo-kv-broken-at-head-dim-128",
+       "severity": "medium",
+       "scope": "the TurboQuant cache types, on both fusion branches. Not PrismML-specific.",
+-      "summary": "turbo3 KV gives PPL 8038.7921 at head_dim 128 and 7.1292 at head_dim 256; turbo4 gives 4064.1819 and 7.0756. Byte-identical per-chunk values on both branches, so it is one shared code path.",
+-      "notCausedBy": "The port, and not the q8_0 breakage above: on the llama.cpp base q8_0 KV at head_dim 128 is correct (10.7160) while turbo3 is not.",
+-      "structure": "A 512-token prompt batch selects BEST_FATTN_KERNEL_TILE and single-token generation selects BEST_FATTN_KERNEL_VEC, so both paths are implicated.",
+-      "nextStep": "Chase the tile kernel's K/V dequantise path in convert.cu, then the rotation group logic at head_dim 128, on the llama.cpp branch where q8_0 is a working control."
++      "summary": "turbo3 KV gave PPL 8038.7921 at head_dim 128 and 7.1292 at head_dim 256; turbo4 gave 4064.1819 and 7.0756.",
++      "status": "NOT re-measured after the dequantize_q8_0 fix",
++      "whyNotReMeasured": "The head_dim 128 fixture (qwen2.5-1.5b-instruct-q8_0) is no longer on disk and both local models are qwen35 with key_length 256, so there is nothing to re-measure it on. Downloading a small 128-dim model is the unblocker.",
++      "suspect": "The head_dim 128 numbers were taken while dequantize_q8_0 was broken. The turbo codecs have their own dequantise functions and should not be affected, but the q8_0 control that was used to separate them was itself defective, so the entry is unproven rather than refuted.",
++      "positiveEvidenceAt256": "turbo3 x turbo3 7.1292, turbo4 x turbo4 7.0756, f16 x turbo3 7.0622, turbo3 x f16 7.0439 - all healthy at head_dim 256 after the fix, on both FA_ALL_QUANTS configurations.",
++      "nextStep": "Re-measure at head_dim 128 with a working q8_0 control before reporting anything to PrismML."
+     }
+   ],
+   "knownGaps": [
+@@ -198,10 +198,10 @@
+     "gpuArchitecture": "gfx1030",
+     "rocm": "7.1"
+   },
+-  "updatedAt": "2026-09-19T18:15:00+08:00",
++  "updatedAt": "2026-09-19T19:20:00+08:00",
+   "buildRecommendation": {
+-    "faAllQuants": "OFF. See knownDefects[0]: turning it on corrupts quantized-V attention for most combinations.",
+-    "hipGraphs": "GGML_HIP_GRAPHS is present in this worktree's CMakeCache but is not wired into build.ninja at all, so the option is inert here. Not a factor either way.",
++    "faAllQuants": "Either. Correctness was previously thought to depend on this; it does not - both configurations now measure 6.94-7.13 across the whole K/V matrix and both pass test-backend-ops FLASH_ATTN_EXT with zero failures. ON compiles every combination (447 s full rebuild, and no silent f16 fallback for exotic pairs); OFF compiles four plus the TurboQuant instances (much shorter build). This worktree is currently left ON.",
++    "hipGraphs": "GGML_HIP_GRAPHS is ON in this CMakeCache and the define is present in build.ninja (154 references), so unlike an earlier note it is NOT inert. It is also not a factor: running with GGML_CUDA_DISABLE_GRAPHS=1 reproduced the 307 failures byte-identically.",
+     "turboInstances": "The TurboQuant FA vec instances are in the explicit CMake list, so they are compiled with FA_ALL_QUANTS=OFF too.",
+     "tests": "This build dir has LLAMA_BUILD_TESTS=ON for the ctest gate, so a bare ninja tries to compile PrismML's test-dspark-forward.cpp, which does not build on Windows (setenv). Build named targets."
+   },
+@@ -209,14 +209,82 @@
+     "targetModel": "Ternary-Bonsai-2-27B (PrismML ternary PQ2_0, qwen35 arch, head_dim 256)",
+     "launcher": "<MODELS>/Bonsai-2-27B/start-bonsai.bat",
+     "kvConfig": "The launcher does not pass -ctk/-ctv, so the model runs on the default f16 KV cache.",
+-    "consequence": "f16 x f16 is healthy in every configuration measured, so the KV defects in knownDefects do not apply to this stack. They are recorded as upstream / PrismML bug reports, not blockers."
++    "consequence": "f16 x f16 is healthy in every configuration measured, and after the dequantize_q8_0 fix every other K/V combination is too. The one remaining unverified item is turbo KV at head_dim 128, which is outside this model's geometry (key_length 256)."
+   },
+   "lastValidation": {
+     "date": "2026-09-19",
+-    "after": "flipping GGML_CUDA_FA_ALL_QUANTS to OFF",
+-    "bench": "-p 512 -n 32 -ngl 99 -fa 1 -r 3 -> 317.65 prompt / 45.70 gen t/s, against 316.44 / 46.13 on the original PrismML build",
+-    "coherence": "capital -> Paris; 17*23 -> 391; a code request is planned correctly",
+-    "launcher": "start-bonsai.bat --list enumerates ROCm0; --cli forwards a quoted prompt intact and answers coherently",
+-    "recordPath": "<STACK>/temp_clean_later/bench-results/bonsai-revalidate"
+-  }
++    "after": "fixing the lost line in dequantize_q8_0 (41d8f6c)",
++    "bench": "-p 512 -n 32 -ngl 99 -fa 1 -r 3 -> 317.22 / 45.72 (FA_ALL_QUANTS=OFF) and 317.15 / 45.99 (ON), against 316.14 / 45.87 for the original PrismML build",
++    "coherence": "capital -> Paris; 17*23 -> 391; a code request is planned correctly - on both configurations",
++    "opGate": "test-backend-ops -o FLASH_ATTN_EXT: 2936/2936 (OFF) and 3949/3949 (ON)",
++    "launcher": "start-bonsai.bat --list enumerates ROCm0; --cli forwards a quoted prompt intact",
++    "recordPaths": [
++      "<STACK>/temp_clean_later/bench-results/bonsai-revalidate-postq8fix",
++      "<STACK>/temp_clean_later/bench-results/bonsai-revalidate-postq8fix-on"
++    ]
++  },
++  "resolvedDefects": [
++    {
++      "id": "dequantize-q8-0-lost-line-in-our-own-port",
++      "severity": "high",
++      "foundAt": "2026-09-19",
++      "introducedBy": "c6fbb78 (our TurboQuant port onto this base)",
++      "fixedBy": "41d8f6c",
++      "file": "ggml/src/ggml-cuda/dequantize.cuh",
++      "function": "dequantize_q8_0()",
++      "lostLine": "v.y *= d;",
++      "effect": "every odd element of a dequantised q8_0 row came back with its raw int8 magnitude instead of the block-scaled value, so any code path that dequantises q8_0 on the GPU produced half-wrong data",
++      "whyItHitAttention": "FA's tile kernel always asks launch_fattn for f16 K and V (need_f16_K/V are hard-coded true in the tile case), so a quantized K or V is converted with to_fp16_cuda -> dequantize_block_q8_0 -> dequantize_q8_0. The vector kernel dequantises q8_0 V itself (dequantize_V_q8_0) and never calls it, which is why only the batch >= 3 cases and the cases whose KV length is not a multiple of 64 failed.",
++      "verification": {
++        "opLevel": {
++          "command": "test-backend-ops -o FLASH_ATTN_EXT on this worktree's build-hip",
++          "before": "2629/2936 passed, 307 failures, all of them q8_0 x q8_0, ERR ~= 1.0",
++          "afterFA_ALL_QUANTS_OFF": "2936/2936 passed, 0 failures",
++          "afterFA_ALL_QUANTS_ON": "3949/3949 passed, 0 failures (more cases because more K/V pairs are compiled instead of being reported unsupported)"
++        },
++        "perplexity": {
++          "harness": "llama-perplexity, an independent harness that shares no code with test-backend-ops, so agreement between the two is what settles it",
++          "model": "SC117 Qwen3.6-35B-A3B, head_dim 256",
++          "settings": "-c 512 -fa 1 --chunks 8 -ngl 999, wiki.test.raw",
++          "q8_0_x_q8_0": {
++            "before": 92.2627,
++            "after": 6.9397,
++            "onB11046Fusion": 6.9824
++          }
++        },
++        "recordPaths": [
++          "temp_clean_later/bench-results/post-fix-kv-matrix",
++          "temp_clean_later/bench-results/prism-fa-allquants-on-postfix",
++          "temp_clean_later/bench-results/q8-0-kv-ab",
++          "temp_clean_later/bench-results/backend-ops-build-hip-after_q8_0_fix-FLASH_ATTN_EXT.log",
++          "temp_clean_later/bench-results/backend-ops-build-hip-on_build_q8fix-FLASH_ATTN_EXT.log"
++        ]
++      },
++      "supersedes": [
++        "fa-all-quants-on-corrupts-quantized-v-attention",
++        "q8_0-kv-pair-broken-on-prism-base"
++      ],
++      "howItWasMissed": "The earlier sweep asserted 'dequantize_q8_0 in dequantize.cuh is byte-identical to upstream'. It is not, and the assertion was never backed by a command. Two later conclusions rested on it: a build option was blamed, then PrismML's fork base was blamed. Both were wrong, and both were stated with more confidence than the evidence supported.",
++      "howToNotRepeat": "After any port or replay, diff the pre-port baseline against the result and account for every deleted non-blank line. scripts/audit-port-deletions.py does exactly that; it finds 14 non-blank deletions on this branch (13 deliberate, 1 lost) and 14 on the b11046 replay (all deliberate)."
++    }
++  ],
++  "corrections": [
++    {
++      "retractedId": "fa-all-quants-on-corrupts-quantized-v-attention",
++      "verdict": "wrong - withdrawn",
++      "why": "GGML_CUDA_FA_ALL_QUANTS=ON does not corrupt anything. With the dequantize fix in place, ON gives f16/q8_0 6.9579, q4_0/q8_0 6.9944, q8_0/q8_0 6.9397 against 6.9921 for f16/f16 - all inside noise. The option only *appeared* responsible because with it off, mixed K/V pairs do not take the FA path at all, so the broken conversion was never exercised.",
++      "whatChangedInTheRecord": "verification.build below records FA_ALL_QUANTS=ON; it was OFF when the matrix in verification.ctest was taken."
++    },
++    {
++      "retractedId": "q8_0-kv-pair-broken-on-prism-base",
++      "verdict": "wrong - withdrawn",
++      "why": "It was our own port. The line is present in PrismML's prism branch (9a9394a) and in the b11046 replay; only c6fbb78 on this branch dropped it. Nothing needs to be reported to PrismML for this.",
++      "alsoWrongInsideIt": "the claim 'dequantize_q8_0 in dequantize.cuh is byte-identical to upstream's' - that was the bug"
++    },
++    {
++      "id": "perplexity-at-head-dim-128",
++      "verdict": "superseded numbers",
++      "why": "verification.ctest.perplexity was taken on the broken build: q8_0 329.4764, turbo3 8038.7921, turbo4 4064.1819. The f16 number (10.6801) is still valid; the other three are not comparable and are kept only as the pre-fix record."
++    }
++  ]
+ }
+diff --git a/fusion/upstream-sync-log.md b/fusion/upstream-sync-log.md
+index d7ee67a..48bc36b 100644
+--- a/fusion/upstream-sync-log.md
++++ b/fusion/upstream-sync-log.md
+@@ -526,3 +526,147 @@ format, so they were all run (greedy, `-ngl 99 -fa 1 -c 2048`):
+ | Bonsai-2-27B-PQ2_0-CRACK | 0 | 44.2 | same |
+ 
+ No crashes, no format differences, no variant-specific behaviour.
++
++---
++
++## Correction: the KV defects were one lost line, and it was ours (2026-09-19, 41d8f6c)
++
++Everything in the two defect entries above about "PrismML's base" and about
++`GGML_CUDA_FA_ALL_QUANTS=ON` was a symptom of a single line that **our own port
++deleted**, and both entries are withdrawn. This section is the record of how it was
++found, what it changes, and what should have caught it.
++
++### The defect
++
++`ggml/src/ggml-cuda/dequantize.cuh`, `dequantize_q8_0()`:
++
++```cpp
++    v.x = x[ib].qs[iqs + 0];
++    v.y = x[ib].qs[iqs + 1];
++
++    v.x *= d;
++    v.y *= d;      // <- this line was missing here
++}
++```
++
++With the line gone, the second element of every dequantised pair came back as the raw
++`int8` magnitude instead of the block-scaled value - roughly 140x too large for a
++typical `d`. No test in the suite added a scaling path, so nothing failed loudly.
++
++It arrived in `c6fbb78` ("port TurboQuant turbo3/turbo4 KV + WHT kernels"). It is
++present in PrismML's own `prism` branch at `9a9394a`, and it is present in the
++b11046 replay on the other branch - **only this tree lost it**.
++
++### Why it looked like an attention bug
++
++`launch_fattn` hard-codes `need_f16_K` and `need_f16_V` to `true` for the **tile**
++kernel, so any quantized K or V is converted on the fly:
++
++```
++to_fp16_cuda -> dequantize_block_q8_0 -> dequantize_q8_0   (broken)
++```
++
++The **vector** kernel does not go through it: `dequantize_V_q8_0` in `fattn-common.cuh`
++is a separate, correct implementation, and the K side uses `vec_dot_fattn_vec_KQ_q8_0`.
++That asymmetry explains every pattern that had been mistaken for a hardware or config
++story:
++
++| observation | explanation |
++| --- | --- |
++| only `q8_0 x q8_0` failed in the op test | only in that pair does a quantized K/V reach FA with `FA_ALL_QUANTS=OFF`; the other quantized pairs are "not supported" there |
++| only `nb >= 3` and `kv % 64 != 0` cases failed | those select TILE; `kv = 113` cannot use the vector kernel either, because `113 % 64 != 0` |
++| `FA_ALL_QUANTS=ON` "corrupted" mixed pairs | ON just lets mixed pairs take the FA path at all; turning it off hid the bug instead of fixing it |
++| `q4_0 x q4_0` was always fine | `dequantize_q4_0` is intact |
++| turbo KV was fine at head_dim 256 | the turbo codecs never call `dequantize_q8_0` |
++
++### Measurements
++
++`test-backend-ops -o FLASH_ATTN_EXT`, this worktree's `build-hip`:
++
++| | before | after |
++| --- | --- | --- |
++| `FA_ALL_QUANTS=OFF` | 2629 / 2936, 307 failures, all `q8_0 x q8_0`, ERR ~= 1.0 | **2936 / 2936** |
++| `FA_ALL_QUANTS=ON` | not run (the option was believed to be the cause) | **3949 / 3949** |
++
++`llama-perplexity` - a harness that shares no code with `test-backend-ops`, which is
++what makes agreement between the two worth anything. SC117, head_dim 256, `-c 512
++-fa 1 --chunks 8`:
++
++| K / V | ON, before | ON, after | OFF, after |
++| --- | --- | --- | --- |
++| f16 / f16 | 6.9921 | 6.9921 | 6.9921 |
++| f16 / q8_0 | **92.5372** | 6.9579 | 6.9735 |
++| q8_0 / f16 | 7.3955 | 6.9824 | 6.9691 |
++| q8_0 / q8_0 | **92.2627** | 6.9397 | 6.9397 |
++| q4_0 / q4_0 | 7.0140 | 7.0140 | 7.0140 |
++| q4_0 / q8_0 | **88.6076** | 6.9944 | 7.0127 |
++| q8_0 / q4_0 | 7.4975 | 6.9985 | 6.9937 |
++| turbo3 / turbo3 | 7.1292 | 7.1292 | 7.1292 |
++| turbo4 / turbo4 | 7.0756 | 7.0756 | 7.0756 |
++| f16 / turbo3 | - | - | 7.0622 |
++| turbo3 / f16 | - | - | 7.0439 |
++
++Whole matrix between 6.94 and 7.13, and the two build configurations agree inside
++run-to-run noise. The `q8_0 x q8_0` value also matches the b11046 fusion build
++(6.9824) and the old b10335 production runtime (6.9397).
++
++Target model re-validated on both configurations, `llama-bench -p 512 -n 32 -r 3`:
++
++| build | prompt tok/s | generation tok/s |
++| --- | --- | --- |
++| fusion, fix, `FA_ALL_QUANTS=OFF` | 317.22 | 45.72 |
++| fusion, fix, `FA_ALL_QUANTS=ON` | 317.15 | 45.99 |
++| original PrismML build | 316.14 / 317.23 | 45.87 / 46.02 |
++
++Coherence (capital -> Paris, 17*23 -> 391, the code request) correct on both.
++
++### Retractions
++
++1. **`fa-all-quants-on-corrupts-quantized-v-attention` - withdrawn.** `ON` does not
++   corrupt anything. The recommendation to build with it off is withdrawn with it;
++   the option is now a build-time/size choice, not a correctness one.
++2. **`q8_0-kv-pair-broken-on-prism-base` - withdrawn.** It was our port. PrismML has
++   nothing to answer for here, and nothing should be filed upstream about it.
++3. The line inside it that read *"`dequantize_q8_0` in `dequantize.cuh` is
++   byte-identical to upstream's"* was **false**. That assertion was the reason the one
++   place that actually differed was never opened. It had no command behind it.
++4. `verification.ctest.perplexity`'s head_dim 128 numbers (q8_0 329.4764, turbo3
++   8038.7921, turbo4 4064.1819) were taken on the broken build and are kept only as
++   the pre-fix record. The f16 value (10.6801) is unaffected.
++
++### The lesson, and the tool that enforces it
++
++A port that is meant to be additive can still lose a line, and it fails silently: the
++build succeeds, every test that does not exercise the lost path passes, and the
++symptom appears somewhere else entirely - here, in FlashAttention kernel selection.
++
++`scripts/audit-port-deletions.py <repo> <base> [head]` lists every deleted non-blank
++line between a baseline and a head, so each one can be justified or restored:
++
++```text
++$ audit-port-deletions.py sources/PrismML-turboquant-fusion 9a9394a
++9 files with deletions, 15 deleted lines total        # 14 non-blank
++  ggml/src/ggml-cuda/dequantize.cuh   (+17 -1, 1 non-blank)
++      -     v.y *= d;                                  <- the bug
++  ggml/src/ggml-cuda/fattn-vec.cuh    (+38 -4)  turbo-aware nthreads, deliberate
++  ggml/src/ggml-cuda/ggml-cuda.cu     (+15 -1)  type list widened, deliberate
++  ggml/src/ggml-hip/CMakeLists.txt    (+9  -1)  bf16 instance moved, deliberate
++  ggml/src/ggml.c                     (+53 -2)  GGML_OP_COUNT, deliberate
++  src/llama-context.cpp               (+11 -2)  TURBO4 128-block rounding, deliberate
++  src/llama-kv-cache.cpp              (+35 -2)  set_rows op_params, deliberate
++```
++
++The same audit on the b11046 fusion worktree (`397b7ae90^..HEAD`) finds 14 non-blank
++deletions, **all deliberate, none in `dequantize.cuh`** - which is the evidence that
++the b11046 replay is clean and this was not a site-wide problem.
++
++### Still open
++
++`turbo-kv-broken-at-head-dim-128` is now **unproven rather than refuted**. Its
++head_dim 128 numbers were taken while `dequantize_q8_0` was broken, and the q8_0
++control used to separate "turbo is broken" from "quantized V is broken" was itself
++defective. Neither local model has a 128-wide head (both `qwen35` with `key_length`
++256), and the 1.5B fixture used for the original measurement is no longer on disk, so
++it cannot be re-measured without fetching a small head_dim 128 model. At head_dim 256
++every turbo pairing is healthy (7.04-7.13, both configurations).
++
