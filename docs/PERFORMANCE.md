@@ -1,13 +1,16 @@
 # 性能测试结果（实测）
 
 **测试平台**：AMD Radeon RX 6900 XT 16 GB · gfx1030 / RDNA2 · ROCm 7.1 · Windows
-**模型**：`Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf`（+ 官方 mmproj）
+**模型**：
+- 主包 `Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf`（+ 官方 mmproj）
+- **无审查包 `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`**（结果见 §1.1）
+
 **运行时**：本仓库 `patches/` 构建出的 `llama-kvmem-server`
 **固定条件**：`-ngl 999` · `--kv-dtype q8_0` · `np 1` · `temperature 0` ·
 `--kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-method retrieval --kvmem-mtp-state snapshots` ·
 每次测量前 GPU 降温
 
-> 数字均为**单次实测**给出的中位/持续值；`±1.5%` 属机内run-to-run 噪声。
+> 数字均为**单次实测**给出的中位/持续值；`±1.5%` 属机内 run-to-run 噪声。
 
 ---
 
@@ -20,6 +23,23 @@
 
 - KVMem 全程生效：常驻池 53,248 cells，长 prompt 期间按块 offload 到主机内存（`need_offload` 触发）
 - 生成阶段无抖动，说明分层 KV 的取回路径没有落在关键路径上
+
+### 1.1 无审查变体（`Abliterated-PQ2_0-MTP`）实测
+
+同一运行时、同一套参数（KVMem + MTP）、同一测试脚本，只换权重：
+
+| 场景 | PQ2_0-MTP-Q8_0（官方） | **Abliterated-PQ2_0-MTP（无审查）** |
+|---|---:|---:|
+| 262144 ctx · 147,725 tok prompt | pp 225.5 · gen 41.7 t/s · 接受率 40.5% | pp 225.5 · **gen 41.7 t/s** · 接受率 **40.5%** |
+| 65536 ctx · 44,414 tok prompt | pp 256.2 · gen 43.5 t/s · 召回 6/6 | pp 256.6 · **gen 40.7 t/s** · 召回 **6/6** |
+| 32768 ctx · 1,620 tok prompt · 256 tok 生成 | 基线 38.8（Abliterated 同口径）| 基线 **38.8** · MTP3 **41.6**（40.9%）· MTP2 **42.5**（51.6%） |
+| 147K 上下文召回 | 6/6 | **5/6**（丢 1 个埋点） |
+| 显存（147K prompt） | ≈11.1 GB | **11.1 GB** |
+| 视觉 | ✅ 官方投影器可用 | ❌ **该包不带投影器**，纯文本 |
+
+> 两个包的张量集合逐项相同（866 张量、`block_count = 65`、零 shape/type 差异），
+> 因此**速度差异落在噪声内**，区别只在权重行为（消融 vs 官方）与投影器是否随包提供。
+> 32768 那一行的三档（基线/MTP3/MTP2）本来就是在 Abliterated 包上测的。
 
 ## 2. 投机解码（MTP）的收益与代价
 

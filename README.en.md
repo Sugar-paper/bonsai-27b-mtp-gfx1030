@@ -31,23 +31,31 @@ Four capabilities live in four different trees, and this GPU needs all of them a
 
 ## Models (not redistributed here)
 
-| File | Source | sha256 |
-|---|---|---|
-| `Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf` | https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP | `3cb3f005…131dd4` |
-| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | same repo | `6807ede6…631903` |
-| original ternary weights | https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf | see that repo |
+Two weight packs are covered; both are `qwen35`, 866 tensors, `block_count = 65` (with the MTP
+head at `blk.64.nextn.*`), so the same runtime and the same flags work for both:
 
-Full hashes: `assets/model-hashes.txt`.
+| File | Source | sha256 | Vision |
+|---|---|---|---|
+| `Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf` | https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP | `3cb3f005…131dd4` | ✅ official mmproj |
+| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | same repo | `6807ede6…631903` | projector |
+| **`Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`** (**uncensored**) | https://huggingface.co/BoldingBuilds/Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP-GGUF | `7aa43b9a…b02e86` | ❌ none ships |
+| original ternary weights | https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf | see that repo | — |
+
+Full hashes: `assets/model-hashes.txt`. Measured on the uncensored pack: 147,725-token prompt →
+prefill 225.5 t/s, generation **41.7 t/s**, MTP accept 40.5%; 44,414-token prompt → prefill
+256.6 t/s, generation 40.7 t/s, recall 6/6; at 32768 ctx: baseline 38.8, MTP n-max 3 41.6, MTP
+n-max 2 **42.5 t/s**. The two packs are tensor-for-tensor identical, so speeds match within noise.
 
 ## Quick start
 
-1. Download the two `.gguf` files into `<release>/model/`
+1. Download the `.gguf` files you want into `<release>/model/`
 2. Extract the three Release zips into `<release>/` (`runtime/`, `runtime/rocblas|hipblaslt`, `hip-compat/`)
 3. Run one of:
 
 ```bat
-scripts\start-bonsai-mtp.bat            :: 262144 ctx, MTP n-max 3, KVMem, thinking on/low
-scripts\start-bonsai-mtp-vision.bat     :: same + vision tower
+scripts\start-bonsai-mtp.bat            :: stock pack, 262144 ctx, MTP 3, KVMem, thinking on/low
+scripts\start-bonsai-mtp-vision.bat     :: stock pack + vision tower
+scripts\start-bonsai-abliterated.bat    :: UNCENSORED pack (text only)
 scripts\start-bonsai-mtp.bat --check    :: validate only
 ```
 

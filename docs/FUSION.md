@@ -60,6 +60,12 @@
 ### 2.5 MTP（投机解码）与 Hadamard 变换
 
 本模型是 `qwen35` 架构、`block_count = 65`、MTP 头在 `blk.64.nextn.*`。
+
+> **两个权重包都适用**：官方 `PQ2_0-MTP-Q8_0`（ProCreations）与**无审查 `Abliterated-PQ2_0-MTP`**
+> （BoldingBuilds）张量集合逐项相同（866 张量、零 shape/type 差异，唯一 KV 差异是 `general.name`），
+> 因此本融合层与同一套启动参数对两者通用；差别只在权重行为与**投影器是否随包提供**
+> （无审查包不带投影器，只能纯文本）。两个包的张量表都在 Release 里，可自行 diff 验证。
+
 MTP 头的 token-embedding 查表必须施加与主干相同的**逆 Hadamard 变换**，否则
 `token_embd.weight` 在被旋转过的基里被读取，图校验会直接拒绝 MTP 上下文。
 

@@ -1,11 +1,12 @@
-# Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0 · 单卡 Radeon RX 6900 XT 可运行方案
+# Ternary-Bonsai-2-27B-PQ2_0-MTP 系列（含**无审查 Abliterated 变体**）· 单卡 Radeon RX 6900 XT 可运行方案
 
 > 让 **27B 三值（ternary, PQ2_0/Q8_0）MTP 模型** 在 **16 GB 的 AMD RX 6900 XT（gfx1030 / RDNA2）** 上
 > 以 **262144 上下文 + 原生 MTP 投机解码 + 视觉输入** 跑起来的一套融合源码、预编译运行时与实测数据。
+> 覆盖两个权重包：官方 `PQ2_0-MTP-Q8_0` 与**无审查** `Abliterated-PQ2_0-MTP`（见 §2.1.1）。
 >
 > This repo publishes a **fusion** (patch series + prebuilt runtime) that makes a ternary 27B
-> MTP model usable on a single 16 GB RDNA2 card, plus the measured numbers. See
-> [`README.en.md`](README.en.md) for the English summary.
+> MTP model usable on a single 16 GB RDNA2 card. Both the stock and the **uncensored
+> (abliterated)** weight packs are covered. See [`README.en.md`](README.en.md).
 
 ---
 
@@ -60,10 +61,36 @@ ggml-org/llama.cpp                       ← 推理引擎（MIT）
 |---|---|---:|---|
 | `Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf` | https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP | 7,657,489,728 B | `3cb3f0056d2e34ee44245a64396004a21f8492573d6ce1266ec4b7222c131dd4` |
 | `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP | 629,246,976 B | `6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903` |
+| **`Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`**（**无审查变体**） | https://huggingface.co/BoldingBuilds/Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP-GGUF | 7,657,489,696 B | `7aa43b9a42f5bebc170d54f45657a7ccad841dd1f5b94434b107945740b02e86` |
 | （可选）原始三值权重/投影器 | https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf | — | 见该仓库 |
 
 > 权重版权归上游发布者所有，本仓库**只发布融合源码、预编译运行时与张量表**，不再分发权重。
 > 国内网络可把 `huggingface.co` 换成 `hf-mirror.com`。
+
+### 2.1.1 两个权重变体的区别（都已实测可用）
+
+| | `PQ2_0-MTP-Q8_0`（ProCreations） | `Abliterated-PQ2_0-MTP`（BoldingBuilds） |
+|---|---|---|
+| 定位 | 官方 MTP 包 | **无审查 / 拒答已移除（abliterated）** |
+| 张量结构 | 866 张量 · `block_count = 65` · MTP 头 `blk.64.nextxn.*` | **完全相同**（866 张量 · 65 blocks） |
+| 视觉投影器 | ✅ 官方 mmproj 可用（同仓库） | ❌ 该包**不带投影器**，只能纯文本 |
+| 启动脚本 | `scripts\start-bonsai-mtp.bat` · `-vision.bat` | `scripts\start-bonsai-abliterated.bat` |
+| 别名 | `bonsai-27b-mtp` / `bonsai-27b-mtp-vision` | `bonsai-27b-abliterated-mtp` |
+| 实测（262144 ctx / 147,725 tok prompt） | pp 225.5 · gen 41.7 t/s · 接受率 40.5% | pp **225.5** · gen **41.7 t/s** · 接受率 **40.5%** |
+| 实测（65536 ctx / 44,414 tok prompt） | pp 256.2 · gen 43.5 t/s | pp **256.6** · gen 40.7 t/s |
+| 召回（32K/64K 上下文埋码） | 6/6 | **6/6** |
+| 召回（147K 上下文） | 6/6 | 5/6（147K 下丢 1 个埋点） |
+
+> **两个包的张量集合逐项相同**（866 张量、零 shape/type 差异，唯一 KV 元数据差异是 `general.name`），
+> 所以同一套运行时/参数对两者通用；差异只在**权重本身**（消融 vs 官方）与**投影器是否随包提供**。
+> 两个变体的张量表都在本仓库 Release 里（`tensor-table-*.csv`），可自行 diff 验证。
+
+用 Python 启动器跑无审查包：
+
+```bash
+python scripts/start-bonsai-mtp.py --model model/Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf \
+                                   --alias bonsai-27b-abliterated-mtp
+```
 
 ### 2.2 取运行时
 
