@@ -24,7 +24,7 @@
 - KVMem 全程生效：常驻池 53,248 cells，长 prompt 期间按块 offload 到主机内存（`need_offload` 触发）
 - 生成阶段无抖动，说明分层 KV 的取回路径没有落在关键路径上
 
-### 1.1 无审查变体（`Abliterated-PQ2_0-MTP`）实测
+### 1.1 无审查版（`Abliterated-PQ2_0-MTP`）实测
 
 同一运行时、同一套参数（KVMem + MTP）、同一测试脚本，只换权重：
 

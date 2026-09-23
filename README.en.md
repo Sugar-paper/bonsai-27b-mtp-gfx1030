@@ -1,8 +1,16 @@
-# Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0 on a single Radeon RX 6900 XT (gfx1030)
+# Ternary-Bonsai-2-27B — censored & uncensored versions, side by side — on a single Radeon RX 6900 XT (gfx1030)
 
 A **fusion** (patch series + prebuilt runtime + measured numbers) that makes a ternary 27B
 MTP model usable on **one 16 GB RDNA2 card** with **262144 context, native MTP speculative
 decoding and image input**.
+
+Two weight packs are published upstream and both run on this stack:
+
+- **stock / censored**: `Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0` (ProCreations) + official vision projector
+- **uncensored**: `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP` (BoldingBuilds), text-only (no projector ships)
+
+They are tensor-for-tensor identical (866 tensors, 65 blocks), so the same runtime and the
+same flags drive both.
 
 > 中文主文档：[`README.md`](README.md) · 融合原理：[`docs/FUSION.md`](docs/FUSION.md)
 

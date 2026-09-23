@@ -9,7 +9,7 @@
 | `hip-compat-b1233-gfx103x-<ver>.zip` | b1233 gfx103X HIP 兼容 DLL（解压到 `hip-compat/`） | ✅ |
 | `tensor-table-Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.csv` / `.txt` | **张量表**：主模型 866 个张量（含 MTP 头） | 参考 |
 | `tensor-table-mmproj-Q8_0.csv` | 视觉投影器 334 个张量 | 参考 |
-| `tensor-table-Abliterated-PQ2_0-MTP.csv` | 无审查变体（同为 866 张量，可供对照） | 参考 |
+| `tensor-table-Abliterated-PQ2_0-MTP.csv` | 无审查版（同为 866 张量，可供对照） | 参考 |
 | `model-hashes.txt` | 三个权重文件的 sha256 与字节数 | ✅ 校验用 |
 | `SHA256SUMS.txt` | 以上所有资产自身的 sha256 | ✅ |
 
