@@ -162,7 +162,7 @@ curl http://127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/js
 ## 4. 性能测试结果（实测，本机单卡）
 
 环境：RX 6900 XT 16 GB / gfx1030 / ROCm 7.1 / Windows ·
-`--kv-dtype q8_0` · `--kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-method retrieval` ·
+`--kv-dtype q8_0` · `--kvmem-budget 98304 --kvmem-gen-reserve 16384 --kvmem-method retrieval`（98304 为 2026-09-24 起的新默认；早期 36864 数据见 PERFORMANCE §0） ·
 `--spec-type draft-mtp` · temperature 0 · 完整数值与原始日志见 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)。
 
 ### 4.1 长上下文（ctx 262144）
