@@ -1,5 +1,9 @@
 # v1.0.0 · Radeon RX 6900 XT (gfx1030)
 
+> **2026-09-24 更新**（同 tag 资产已刷新）：`--kvmem-budget` 默认 36864→98304（长上下文 pp 提速）、
+> gated_delta_net rows 状态上 ROCm、llama-bench 回归修复。官方 Q8_0 实测 pp512=607.5 t/s、
+> pp4096=591.4 t/s、tg128=45.7 t/s、视觉识别 32 s 正确。详见 `docs/PERFORMANCE.md`。
+
 首次发布：让 **Ternary-Bonsai-2-27B-PQ2_0-MTP** 系列在 **单张 16 GB RDNA2 卡**上以
 **262144 上下文 + 原生 MTP 投机解码 + 视觉输入**运行。**两个权重包都支持**：
 

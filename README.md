@@ -8,6 +8,10 @@
 > MTP model usable on a single 16 GB RDNA2 card. Both the stock and the **uncensored
 > (abliterated)** weight packs are covered. See [`README.en.md`](README.en.md).
 
+> **2026-09-24 更新**：长上下文 pp 提速（`--kvmem-budget` 默认 36864 → 98304，52K prompt 顶端边际
+> pp **+37%**）、gated_delta_net rows 状态上 ROCm、llama-bench 回归修复；官方 Q8_0 实测 pp512=607.5 t/s、
+> 视觉识别 32 s 正确。详见 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §0/§0.1/§4。
+
 ---
 
 ## 目录

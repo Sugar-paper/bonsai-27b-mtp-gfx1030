@@ -49,6 +49,34 @@
 （96K tok ≈ 6.3 GB q8_0 KV；权重 7.7 GB + 6.3 GB + 计算缓冲 ≈ 15 GB / 16 GB，实测稳定）。
 生成端速率在该配置下待复测（初步 ~23–41 t/s 区间，样本不足不下结论）。
 
+### 0.1 代码级排查与 llama-bench 短上下文基线（2026-09-24 同日）
+
+`llama-bench`（此前因合并引入的 threadpool 回归崩溃，已修复）恢复后，官方 Q8_0 包短上下文基线：
+
+| 测试 | t/s |
+|---|---:|
+| pp512 | **607.5** |
+| pp4096 | 591.4 |
+| tg128 | 45.7 |
+
+结合源码排查（模型 = qwen35 混合架构，`full_attn_interval = 4`，即每 4 层 1 层全注意力、3/4 层门控
+DeltaNet/SSM）得出三点**结论**：
+
+1. **SSM 串行扫描不是瓶颈**：全模型（含 3/4 SSM 层）短上下文 pp ≈ 607 t/s，与 GEMM 上限同量级；
+   信封估算 SSM 扫描只占 prefill ~1.5%。因此**未实现**分块关联扫描内核（上游 `gated_delta_net.cu`
+   的 `//TODO: Add chunked kernel` 也仍开放）——性价比不足以投入。
+2. 长上下文 pp 衰减（607 → 225 t/s @147K）来自 **attention 随上下文增长 + KV 换页**，后者已由 budget 修复。
+3. GEMM 段已 ~100% 硬件饱和（RDNA2 无矩阵核心，纯 SIMD FMA）。
+
+**本轮落地的代码级改动**（融合树 `fb903aa` / `e91f754`）：
+
+- **gated_delta_net rows 状态上 ROCm**：`gated_delta_net.cu` 增加 `ROWS` 模板 + rows 索引状态读（`src[6]`），
+  让 recurrent decode 图在 CUDA/ROCm 上跳过每层 `get_rows` gather（原为 CPU/Metal 专享）；`qwen35.cpp`
+  放开 `gdn_state_rows_dev_ok`。向后兼容，MTP decode 冒烟通过。
+- **bcast 配置 plumbing**：`ggml_gdn_bcast` 枚举 + `ggml_gated_delta_net_set_bcast()`（op param 2），
+  interleaved 为默认/唯一实现（本模型本就最优），tiled 保留待上游 PR #19468 的 stride 约定。
+- **llama-bench threadpool 修复**：跳过外部 threadpool attach（合并回归，见源码注释）。
+
 ---
 
 ## 1. 长上下文（ctx 262144，MTP n-max 3）
@@ -115,9 +143,12 @@
 |---|---|
 | 图像 token 数 | 1,079（不加 `--image-min-tokens` 时 315） |
 | 识别正确性 | 形状（圆/方/三角）、颜色、图内文字全部正确 |
-| **首帧（冷）** | **≈135 s** |
+| **首帧（冷）** | **≈135 s**（大图/首次）；小图实测 **32 s** |
 | 预热后 | 2.0 s |
 | 文本任务影响 | 无（投影器在 CPU 侧，文本生成不受影响） |
+
+2026-09-24 复测（新运行时，400×200 合成图「红色正方形 + 蓝色椭圆 + `17*23`」）：
+服务就绪 8 s、视觉响应 **32 s**、输出 **「红色正方形，蓝色椭圆；17*23=391」** 完全正确。
 
 模型自带加载器在一开始就警告：Qwen-VL 类投影器建议 ≥1024 图像 token 以保证接地精度 ——
 因此默认打开 `--image-min-tokens 1024`（可用 `IMGMINTOK=0` 关掉换取 3 倍便宜的图像预填充）。
