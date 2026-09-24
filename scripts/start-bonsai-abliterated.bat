@@ -19,9 +19,8 @@ rem    262144 ctx / 199,950 tok prompt : pp 242.97 t/s, gen 33.9 t/s (thinking o
 rem     65536 ctx /  44,414 tok prompt : pp 256.6 t/s, gen 40.7 t/s, accept 40.5%
 rem     32768 ctx /   1,620 tok prompt : 38.8 t/s baseline, 41.6 (MTP 3), 42.5 (MTP 2)
 rem
-rem  Vision: set MMPROJ to the official projector and the launcher adds it.
-rem    set MMPROJ=%ROOT%\model\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf
-rem    start-bonsai-abliterated.bat
+rem  Vision: ON by default when the stock projector is present in model\ .
+rem    set NOVISION=1 ^& start-bonsai-abliterated.bat   (text-only)
 rem
 rem  Usage:
 rem     start-bonsai-abliterated.bat [--check]
@@ -36,9 +35,11 @@ set "MODEL=%ROOT%\model\Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf"
 set "ROCM=%ProgramFiles%\AMD\ROCm\7.1"
 
 rem --- vision: the uncensored pack ships no projector, but the tensor-identical
-rem --- stock mmproj works. Point MMPROJ at it to enable vision (default off).
-if not defined MMPROJ set "MMPROJ="
+rem --- stock mmproj works. Default: %ROOT%\model\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf
+rem --- (present -> vision ON; missing -> automatic text-only fallback).
+if not defined MMPROJ set "MMPROJ=%ROOT%\model\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
 if not defined IMGMINTOK set "IMGMINTOK=1024"
+if not defined NOVISION set "NOVISION=0"
 
 if not defined CTX     set "CTX=262144"
 if not defined PORT    set "PORT=11234"
@@ -66,20 +67,24 @@ if not exist "%RUNTIME%\llama-kvmem-server.exe" ( echo [ERROR] runtime not found
 if not exist "%MODEL%" ( echo [ERROR] model not found: %MODEL% & echo         Download it from Hugging Face - see README.md section 2 & goto fail )
 if not exist "%TEMPLATE%" ( echo [WARN] compat chat template missing & set "TEMPLATE=" )
 
-rem --- vision flags: reuse the tensor-identical official mmproj (set MMPROJ)
+rem --- vision flags: reuse the tensor-identical official mmproj (NOVISION=1 to disable)
 set "VFLAGS="
+if not "%NOVISION%"=="0" goto vision_flags_done
 if defined MMPROJ (
     if not exist "%MMPROJ%" ( echo [warn] projector not found ^(%MMPROJ%^) - text-only & set "MMPROJ=" )
 )
 if defined MMPROJ set "VFLAGS=--mmproj "%MMPROJ%" --no-mmproj-offload"
 if defined MMPROJ if not "%IMGMINTOK%"=="0" set "VFLAGS=%VFLAGS% --image-min-tokens %IMGMINTOK%"
+:vision_flags_done
 
 echo ===========================================================================
 echo  Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP  ^|  %CTX% ctx, MTP x%NMTP%
 echo ===========================================================================
 echo  runtime : %RUNTIME%
 echo  model   : %MODEL%
-if defined MMPROJ ( echo  vision  : ON   mmproj=%MMPROJ% ) else ( echo  vision  : OFF (set MMPROJ to reuse the official mmproj) )
+if not "%NOVISION%"=="0" echo  vision  : OFF ^(NOVISION set^)
+if "%NOVISION%"=="0" if defined MMPROJ echo  vision  : ON   mmproj=%MMPROJ%
+if "%NOVISION%"=="0" if not defined MMPROJ echo  vision  : OFF ^(projector not found^)
 echo  think   : on, effort=%EFFORT%   http://%HOSTBIND%:%PORT%
 echo  note    : UNCENSORED pack - ships no projector, reuses the official mmproj
 echo  stop    : Ctrl+C
