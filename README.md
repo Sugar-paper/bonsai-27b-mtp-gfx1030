@@ -24,6 +24,7 @@
 | Release 资产（含张量表） | [`docs/PACKAGING.md`](docs/PACKAGING.md) |
 | 上游与本仓库的关系 | 本文 §1 · [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) |
 | 融合补丁（24 个） | [`patches/`](patches/) · [`patches/SERIES.md`](patches/SERIES.md) |
+| 聊天模板评估（思考废话/Qwen-Sharp） | [`docs/CHAT-TEMPLATES.md`](docs/CHAT-TEMPLATES.md) |
 
 ---
 
