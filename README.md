@@ -151,7 +151,7 @@ curl http://127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/js
 | 张量库 | `runtime/rocblas/library` + `runtime/hipblaslt/library` | 必须与 gfx1030 匹配；缺失时报错发生在 `rocblas_initialize`，不会给 HTTP 状态码 |
 | 显存 | 16 GB | 262144 ctx 的 KV cache 约 17 GB ⇒ **必须开 KVMem**；纯 KV 方案在 131072 就会 OOM |
 | 内存 | ≥ 32 GB（KVMem 会把 KV 分层缓存到主机内存） | 实测常驻约 3–8 GB |
-| Python（可选） | 3.10+ | 仅 `scripts/start-bonsai-mtp.py` 需要，零第三方依赖 |
+| **无残留进程** | 启动前确认旧的 `llama-kvmem-server.exe` / `llama-server.exe` 已退出 | 三个启动器默认端口都是 **11234**；旧服务没关，新实例会显存不足 → 部分层落 CPU，**速度掉 10 倍以上**。清理：`taskkill /F /IM llama-kvmem-server.exe` |
 
 编译细节、VRAM 预算推导、常见报错对照表见 [`docs/HARDWARE-GFX1030.md`](docs/HARDWARE-GFX1030.md)。
 
