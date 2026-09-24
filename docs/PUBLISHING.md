@@ -88,7 +88,7 @@ gh release create v1.0.0 \
 
 - [ ] `privacy scan`：仓库内没有任何个人路径 / IP / 邮箱 / 主机名
 - [ ] `git log --format='%an <%ae>'` 只出现中立身份
-- [ ] 三个 zip 解压到同一目录后，`scripts/start-bonsai-mtp.py --check` 通过
+- [ ] 三个 zip 解压到同一目录后，`scripts/start-bonsai-mtp.bat --check` 通过
 - [ ] 真实启动一次并成功对话（验证过 `17*23=391`）
 - [ ] `.gitignore` 生效：`git status` 中不出现 `assets/*.zip`
 - [ ] README 里的 sha256 与实际资产一致（`sha256sum -c assets/SHA256SUMS.txt`）

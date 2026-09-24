@@ -64,14 +64,11 @@ n-max 2 **42.5 t/s**. The two packs are tensor-for-tensor identical, so speeds m
 
 ```bat
 scripts\start-bonsai-mtp.bat            :: stock pack, 262144 ctx, MTP 3, KVMem, thinking on/low
-scripts\start-bonsai-mtp-vision.bat     :: stock pack + vision tower
 scripts\start-bonsai-abliterated.bat    :: UNCENSORED pack (vision reuses stock mmproj)
 scripts\start-bonsai-mtp.bat --check    :: validate only
 ```
 
 ```bash
-python scripts/start-bonsai-mtp.py --check
-python scripts/start-bonsai-mtp.py --vision --effort medium
 ```
 
 OpenAI-compatible endpoint: `POST http://127.0.0.1:11234/v1/chat/completions`.

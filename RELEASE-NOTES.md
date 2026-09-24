@@ -32,7 +32,6 @@
 
 ```bat
 scripts\start-bonsai-mtp.bat            :: 官方包 · 262144 ctx
-scripts\start-bonsai-mtp-vision.bat     :: 官方包 + 视觉
 scripts\start-bonsai-abliterated.bat    :: 无审查包（视觉复用官方 mmproj）
 ```
 

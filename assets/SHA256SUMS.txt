@@ -1,8 +1,8 @@
-1a76ae789c7bec668187db74cd4fc974dd809ed3febaeeadbeb3d77f7389a71c  assets/hip-compat-b1233-gfx103x-v1.0.0.zip
+a71a295c6c5d7e139f3aaf01127861d767b54dc0d7a1869c9f749385050985ee  assets/hip-compat-b1233-gfx103x-v1.0.0.zip
 ec5630fd4addd3964b9b72589810b0119d975e5387c5b07c1e4f61b5591275ef  assets/model-hashes.txt
-5889ab2e5b9c15ce6f34420be68c79c95dfb1bd5576828cb1c1f13649237bd63  assets/runtime-bin-v1.0.0.zip
-b9546b6b41b6d00395778ad8ccc377a08b23460232c1a89e4270321859adb91b  assets/runtime-tensile-gfx1030-v1.0.0.zip
-f97ef1f305f25a49ab96c1ecb3e04a47a77b7eaf7bb064a1687f3d76f713f7c5  assets/SHA256SUMS.txt
+71191f2612449f64a9917620789762e83dd05e5f9dec214757d8df4aa94aa124  assets/runtime-bin-v1.0.0.zip
+8d4319ee1a9650d97769e5d4611774b8d18c3bdecc042f96f34750d36bebfe35  assets/runtime-tensile-gfx1030-v1.0.0.zip
+dbacebbf1b99fdb2f4f0ee219acabf30c0f4684d3e1737efdd86762b43e52f6b  assets/SHA256SUMS.txt
 128c1cb1e75a8c78a35f00e3c68cede066285b9614a0ac1875827717f23f69b1  assets/tensor-table-Abliterated-PQ2_0-MTP.csv
 f39c3946f6160c390493c4e437ac7a7c52360e0a75f8eecf7a3ab8033abc0b72  assets/tensor-table-mmproj-Q8_0.csv
 4167b9abb7622069dcf7da5cb9a0e5116af73c3e0b28f8aff67417d03ea4a25a  assets/tensor-table-Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.csv

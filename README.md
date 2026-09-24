@@ -115,22 +115,12 @@ python scripts/start-bonsai-mtp.py --model model/Ternary-Bonsai-2-27B-Abliterate
 :: Windows，命令行里执行
 cd <release>\scripts
 start-bonsai-mtp.bat                :: 262144 ctx + MTP + KVMem，思考默认 on/low
-start-bonsai-mtp-vision.bat         :: 同上 + 视觉投影器
 start-bonsai-abliterated.bat        :: 无审查包（纯文本）
 start-bonsai-mtp.bat --check        :: 只校验前置条件与最终命令，不启动
 
 :: 无审查包开视觉：复用官方 mmproj（两包张量逐项相同）
 set MMPROJ=<release>\model\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf
 start-bonsai-abliterated.bat
-```
-
-或跨平台用 Python：
-
-```bash
-python scripts/start-bonsai-mtp.py --check          # 自检
-python scripts/start-bonsai-mtp.py                  # 默认 256K, MTP n-max 3
-python scripts/start-bonsai-mtp.py --vision         # 开启视觉
-python scripts/start-bonsai-mtp.py --ctx 65536 --effort xhigh
 ```
 
 服务是 **OpenAI 兼容** 的：
