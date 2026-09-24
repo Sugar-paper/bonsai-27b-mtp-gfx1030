@@ -1,12 +1,11 @@
-# Ternary-Bonsai-2-27B · 审查 / 无审查**两个版本并存** · 单卡 Radeon RX 6900 XT 可运行方案
+# 27B 塞进 16GB 显卡 · 256K 上下文 · Qwen3.8 系无审查三值模型 · RX 6900 XT 实测
 
-> 让 **27B 三值（ternary, PQ2_0/Q8_0）MTP 模型** 在 **16 GB 的 AMD RX 6900 XT（gfx1030 / RDNA2）** 上
-> 以 **262144 上下文 + 原生 MTP 投机解码 + 视觉输入** 跑起来的一套融合源码、预编译运行时与实测数据。
-> 覆盖两个权重包：官方 `PQ2_0-MTP-Q8_0` 与**无审查** `Abliterated-PQ2_0-MTP`（见 §2.1.1）。
+> **Ternary-Bonsai-2-27B**（Qwen3.8 系架构三值量化，PQ2_0/Q8_0，2.13 bpw）在 **16 GB 的 AMD RX 6900 XT
+> （gfx1030 / RDNA2）** 上以 **262144 上下文 + MTP 投机解码 + 视觉输入** 运行，官方与**无审查**两个版本
+> 均实测通过。融合源码补丁 + 预编译运行时 + 张量表 + 全套启动脚本。
 >
-> This repo publishes a **fusion** (patch series + prebuilt runtime) that makes a ternary 27B
-> MTP model usable on a single 16 GB RDNA2 card. Both the stock and the **uncensored
-> (abliterated)** weight packs are covered. See [`README.en.md`](README.en.md).
+> A **fusion** (patch series + prebuilt runtime) that runs a **Qwen3.8-class ternary 27B** model
+> (uncensored + vision) at **256K context** on a single 16 GB RDNA2 card. Both weight packs verified.
 
 > **2026-09-24 更新**：长上下文 pp 提速（`--kvmem-budget` 默认 36864 → 98304，52K prompt 顶端边际
 > pp **+37%**）、gated_delta_net rows 状态上 ROCm、llama-bench 回归修复；官方 Q8_0 实测 pp512=607.5 t/s、

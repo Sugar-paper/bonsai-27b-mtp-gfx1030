@@ -1,8 +1,10 @@
-# Ternary-Bonsai-2-27B — censored & uncensored versions, side by side — on a single Radeon RX 6900 XT (gfx1030)
+# 27B on a 16GB GPU · 256K Context · Qwen3.8-Class Uncensored Ternary Model · RX 6900 XT
 
-A **fusion** (patch series + prebuilt runtime + measured numbers) that makes a ternary 27B
-MTP model usable on **one 16 GB RDNA2 card** with **262144 context, native MTP speculative
-decoding and image input**.
+**Ternary-Bonsai-2-27B** (Qwen3.8-class ternary quant, PQ2_0/Q8_0, 2.13 bpw) runs on
+**one 16 GB RDNA2 card** with **262144 context, native MTP speculative decoding and image
+input** — stock and uncensored weight packs both verified.
+
+A **fusion** (patch series + prebuilt runtime + measured numbers).
 
 Two weight packs are published upstream and both run on this stack:
 
