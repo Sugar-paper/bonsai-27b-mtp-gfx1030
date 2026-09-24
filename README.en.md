@@ -7,7 +7,7 @@ decoding and image input**.
 Two weight packs are published upstream and both run on this stack:
 
 - **stock / censored**: `Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0` (ProCreations) + official vision projector
-- **uncensored**: `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP` (BoldingBuilds), text-only (no projector ships)
+- **uncensored**: `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP` (BoldingBuilds) - vision works via the stock mmproj (packs are tensor-identical)
 
 They are tensor-for-tensor identical (866 tensors, 65 blocks), so the same runtime and the
 same flags drive both.
@@ -63,7 +63,7 @@ n-max 2 **42.5 t/s**. The two packs are tensor-for-tensor identical, so speeds m
 ```bat
 scripts\start-bonsai-mtp.bat            :: stock pack, 262144 ctx, MTP 3, KVMem, thinking on/low
 scripts\start-bonsai-mtp-vision.bat     :: stock pack + vision tower
-scripts\start-bonsai-abliterated.bat    :: UNCENSORED pack (text only)
+scripts\start-bonsai-abliterated.bat    :: UNCENSORED pack (vision reuses stock mmproj)
 scripts\start-bonsai-mtp.bat --check    :: validate only
 ```
 

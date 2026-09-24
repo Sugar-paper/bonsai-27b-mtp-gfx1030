@@ -77,7 +77,7 @@ ggml-org/llama.cpp                       ← 推理引擎（MIT）
 |---|---|---|
 | 定位 | 官方 MTP 包 | **无审查 / 拒答已移除（abliterated）** |
 | 张量结构 | 866 张量 · `block_count = 65` · MTP 头 `blk.64.nextxn.*` | **完全相同**（866 张量 · 65 blocks） |
-| 视觉投影器 | ✅ 官方 mmproj 可用（同仓库） | ❌ 该包**不带投影器**，只能纯文本 |
+| 视觉投影器 | ✅ 官方 mmproj | ✅ **可复用官方 mmproj**（两包张量逐项相同；本包不自带） |
 | 启动脚本 | `scripts\start-bonsai-mtp.bat` · `-vision.bat` | `scripts\start-bonsai-abliterated.bat` |
 | 别名 | `bonsai-27b-mtp` / `bonsai-27b-mtp-vision` | `bonsai-27b-abliterated-mtp` |
 | 实测（262144 ctx / 147,725 tok prompt） | pp 225.5 · gen 41.7 t/s · 接受率 40.5% | pp **225.5** · gen **41.7 t/s** · 接受率 **40.5%** |
@@ -86,7 +86,7 @@ ggml-org/llama.cpp                       ← 推理引擎（MIT）
 | 召回（147K 上下文） | 6/6 | 5/6（147K 下丢 1 个埋点） |
 
 > **两个包的张量集合逐项相同**（866 张量、零 shape/type 差异，唯一 KV 元数据差异是 `general.name`），
-> 所以同一套运行时/参数对两者通用；差异只在**权重本身**（消融 vs 官方）与**投影器是否随包提供**。
+> 所以同一套运行时/参数对两者通用；差异只在**权重本身**（消融 vs 官方）。视觉投影器共用官方 mmproj（两包张量逐项相同，可复用）。
 > 两个版本的张量表都在本仓库 Release 里（`tensor-table-*.csv`），可自行 diff 验证。
 
 用 Python 启动器跑无审查包：
@@ -117,7 +117,12 @@ python scripts/start-bonsai-mtp.py --model model/Ternary-Bonsai-2-27B-Abliterate
 cd <release>\scripts
 start-bonsai-mtp.bat                :: 262144 ctx + MTP + KVMem，思考默认 on/low
 start-bonsai-mtp-vision.bat         :: 同上 + 视觉投影器
+start-bonsai-abliterated.bat        :: 无审查包（纯文本）
 start-bonsai-mtp.bat --check        :: 只校验前置条件与最终命令，不启动
+
+:: 无审查包开视觉：复用官方 mmproj（两包张量逐项相同）
+set MMPROJ=<release>\model\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf
+start-bonsai-abliterated.bat
 ```
 
 或跨平台用 Python：
@@ -173,8 +178,12 @@ curl http://127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/js
 
 | prompt 长度 | pp | 生成 | MTP 接受率 | 显存 |
 |---:|---:|---:|---:|---:|
-| 147,725 tok | **225.5 t/s** | **41.7 t/s**（1024 tok 持续） | 40.5% | ~11.1 GB |
-| 44,414 tok | 256.6 t/s | 40.7 t/s | 40.5% | ~11.3 GB |
+| **199,950 tok（≈256K 上下文）** | **242.97 t/s**（budget 98304） | 33.9 t/s（70 tok，思考计入） | — | ~11.5 GB |
+| 147,725 tok | 225.5 t/s（旧 budget 36864） | 41.7 t/s（1024 tok 持续） | 40.5% | ~11.1 GB |
+| 44,414 tok | 256.6 t/s（旧 budget） | 40.7 t/s | 40.5% | ~11.3 GB |
+
+> 2026-09-24 起默认 `--kvmem-budget 98304`：**256K 上下文已实测可用**（~200K token 长 prompt
+> 全量 prefill + 生成，答案正确、无 OOM），且 pp 比旧 budget 的 147K（225.5）还高 **+7.7%**。
 
 ### 4.2 MTP 投机解码的收益（ctx 32768，1620 tok prompt，生成 256 tok）
 

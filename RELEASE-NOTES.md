@@ -8,7 +8,7 @@
 **262144 上下文 + 原生 MTP 投机解码 + 视觉输入**运行。**两个权重包都支持**：
 
 - 官方 `Ternary-Bonsai-2-27B-PQ2_0-MTP-Q8_0.gguf`（ProCreations）—— 含官方视觉投影器
-- **无审查 `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`（BoldingBuilds）** —— 该包不带投影器，纯文本
+- **无审查 `Ternary-Bonsai-2-27B-Abliterated-PQ2_0-MTP.gguf`（BoldingBuilds）** —— 本包不自带投影器，但可复用官方 mmproj（两包张量逐项相同）
 
 两者张量集合**逐项相同**（866 张量 · `block_count = 65` · MTP 头在 `blk.64.nextn.*`），
 因此同一运行时与同一套参数通用；实测速度差在噪声内（见下）。
@@ -33,7 +33,7 @@
 ```bat
 scripts\start-bonsai-mtp.bat            :: 官方包 · 262144 ctx
 scripts\start-bonsai-mtp-vision.bat     :: 官方包 + 视觉
-scripts\start-bonsai-abliterated.bat    :: 无审查包（纯文本）
+scripts\start-bonsai-abliterated.bat    :: 无审查包（视觉复用官方 mmproj）
 ```
 
 ## 实测（RX 6900 XT 16 GB / ROCm 7.1 / q8_0 KV / KVMem）
@@ -44,7 +44,7 @@ scripts\start-bonsai-abliterated.bat    :: 无审查包（纯文本）
 | 65536 ctx · 44,414 tok prompt | pp 256.2 · gen 43.5 t/s | pp 256.6 · gen 40.7 t/s |
 | 32768 ctx · 生成 256 tok | **MTP n-max 2：42.5 t/s（51.6%）** · MTP3：41.6（40.9%）· 基线 38.8 | 同口径（该组即在本包上测） |
 | 召回 | 32K/64K **6/6** · 147K 6/6 | 32K/64K **6/6** · 147K 5/6 |
-| 视觉 | ✅ 1,079 图像 token；识别正确；首帧冷启动 ≈135 s、预热 2.0 s | ❌ 无投影器 |
+| 视觉 | ✅ 1,079 图像 token；识别正确；首帧冷启动 ≈135 s、预热 2.0 s | ✅ 复用官方 mmproj（实测 32 s 冷启动、识别正确） |
 | 思考档位 | `low` 自然收尾（678 字符思维链）；`xhigh` 失控（16,596 tok / 5m48s 撞上限） | 同 |
 
 ## 已知限制
@@ -52,7 +52,7 @@ scripts\start-bonsai-abliterated.bat    :: 无审查包（纯文本）
 1. `turbo3`/`turbo4` KV 在 `head_dim = 128` 不可用（本模型 `key_length = 256`，正常）
 2. MTP 非严格无损（`temperature=0` 下开关存在字节差异）
 3. 思考需设档（默认 `low`）
-4. 视觉首帧 ≈2 分钟属预期；**无审查包没有投影器**
+4. 视觉首帧 ≈2 分钟属预期；**无审查包不自带投影器，但复用官方 mmproj**
 5. 仅在 gfx1030 验证
 6. 服务默认无鉴权、默认只绑 `127.0.0.1`
 
