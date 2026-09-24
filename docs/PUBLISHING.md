@@ -8,7 +8,7 @@
 
 | 项 | 建议值 |
 |---|---|
-| 仓库名 | `bonsai-27b-mtp-gfx1030` |
+| 仓库名 | `qwen3.8-27b-6900xt-40tps`（原名 `bonsai-27b-mtp-gfx1030`，旧链接自动重定向） |
 | 描述 | `Fusion patches + prebuilt runtime + tensor tables: run a ternary 27B MTP model at 256K on a single 16 GB Radeon RX 6900 XT (gfx1030)` |
 | 话题（Topics） | `llama-cpp` `rocm` `gfx1030` `rdna2` `kv-cache` `speculative-decoding` `ternary` `huggingface` |
 | Release 标签 | `v1.0.0` |
